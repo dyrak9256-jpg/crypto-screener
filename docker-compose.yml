@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  postgres:
+  image: postgres:16-alpha
+  container_name: screener_postgres
+  environment:
+    POSTGRES_USER: screener_user
+    POSTGRES_PASSWORD: screener_password
+    POSTGRES_DB: screener_db
+  ports:
+    - "5432:5432"
+  volumes:
+    - pgdata:/var/lib/postgresql/data
+  
