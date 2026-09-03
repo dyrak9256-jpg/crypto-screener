@@ -1,15 +1,29 @@
-version: '3.8'
-
 services:
   postgres:
-  image: postgres:16-alpha
-  container_name: screener_postgres
-  environment:
-    POSTGRES_USER: screener_user
-    POSTGRES_PASSWORD: screener_password
-    POSTGRES_DB: screener_db
-  ports:
-    - "5432:5432"
-  volumes:
-    - pgdata:/var/lib/postgresql/data
-  
+    image: postgres:16-alpine
+    container_name: screener_postgres
+    environment:
+      POSTGRES_USER: screener_user
+      POSTGRES_PASSWORD: screener_password
+      POSTGRES_DB: screener_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U screener_user -d screener_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: screener_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
