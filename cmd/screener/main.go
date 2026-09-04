@@ -1,27 +1,58 @@
 package main
 
 import (
-	"fmt"
-	"time"
-
+	"context"
+	"crypto-screener/internal/adapters/binance"
+	"crypto-screener/internal/adapters/postgres"
+	"crypto-screener/internal/adapters/telegram"
+	"crypto-screener/internal/app"
+	"crypto-screener/internal/config"
 	"crypto-screener/internal/domain"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
-	"github.com/shopspring/decimal"
+	"github.com/joho/godotenv"
 )
 
 func main() {
-	fmt.Println("🚀 Инициализация скринера...")
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	tick := domain.MarketTick{
-		Exchange:   "BINANCE",
-		Symbol:     "BTCUSDT",
-		MarketType: domain.MarketTypeSpot,
-		BestBid:    decimal.NewFromFloat(65000.50),
-		BestAsk:    decimal.NewFromFloat(65001.00),
-		Volume24h:  decimal.NewFromFloat(50000000.00),
-		Timestamp:  time.Now(),
+	if err := godotenv.Load(); err != nil {
+		log.Println("⚠️ Файл .env не найден. Используем системные переменные окружения.")
 	}
 
-	fmt.Printf("Тикер: %s %s [%s] | Bid: %s | Ask: %s | Vol24h: $%s\n",
-		tick.Exchange, tick.Symbol, tick.MarketType, tick.BestBid, tick.BestAsk, tick.Volume24h)
+	cfg := config.Load()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() { <-sigChan; log.Println("Received shutdown signal"); cancel() }()
+
+	dbRepo, err := postgres.NewRepository(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Fatalf("DB Error: %v", err)
+	}
+	defer dbRepo.Close()
+
+	screenerCfg := domain.NewScreenerConfig(cfg.HardMinSpread, cfg.HardMinVolume)
+	application := app.NewApplication(screenerCfg, dbRepo)
+
+	tgBot, err := telegram.NewBot(cfg.TelegramToken, cfg.TelegramChatID, application)
+	if err != nil {
+		log.Fatalf("TG Error: %v", err)
+	}
+
+	application.SetTelegramSender(tgBot)
+	go tgBot.StartPolling(ctx)
+
+	binanceAdapter := binance.NewAdapter()
+	application.GetConnectorManager().AddConnector("BINANCE", binanceAdapter, ctx)
+
+	if err := application.Run(ctx, dbRepo); err != nil {
+		log.Fatalf("App failed: %v", err)
+	}
 }
