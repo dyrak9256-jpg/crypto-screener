@@ -2,152 +2,168 @@ package binance
 
 import (
 	"context"
-	"encoding/json"
+	"crypto-screener/internal/domain"
 	"fmt"
 	"log"
 	"time"
 
-	"crypto-screener/internal/domain"
-
+	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
 	"github.com/shopspring/decimal"
 )
 
 const (
-	// Публичный WebSocket поток всех Best Bid/Ask тикеров Binance Spot
-	binanceSpotWS = "wss://stream.binance.com:9443/ws/!bookTicker"
-	// Публичный WebSocket поток всех Best Bid/Ask тикеров Binance Futures
-	binanceFuturesWS = "wss://fstream.binance.com/ws/!bookTicker"
-
-	// Таймауты и задержки
-	dialTimeout    = 10 * time.Second
-	reconnectDelay = 3 * time.Second
+	spotWS    = "wss://stream.binance.com:9443/ws/!ticker"
+	futuresWS = "wss://fstream.binance.com/ws/!ticker"
+	fundingWS = "wss://fstream.binance.com/ws/!markPrice@arr"
 )
 
-// binanceBookTickerWS — структура JSON ответа от Binance !bookTicker
-type binanceBookTickerWS struct {
+type tickerPayload struct {
 	Symbol  string `json:"s"`
 	BestBid string `json:"b"`
 	BestAsk string `json:"a"`
+	QVolume string `json:"q"`
 }
 
-// Adapter — структура адаптера биржи Binance
+type fundingPayload struct {
+	Symbol          string `json:"s"`
+	FundingRate     string `json:"r"`
+	NextFundingTime int64  `json:"T"`
+}
+
 type Adapter struct{}
 
-// NewAdapter создает новый экземпляр адаптера Binance
-func NewAdapter() *Adapter {
-	return &Adapter{}
-}
+func NewAdapter() *Adapter { return &Adapter{} }
 
-// ConnectSpot подключается к WebSocket спотового рынка Binance и транслирует тикеры в outChan
 func (a *Adapter) ConnectSpot(ctx context.Context, outChan chan<- domain.MarketTick) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	go a.listenToStream(ctx, binanceSpotWS, domain.MarketTypeSpot, outChan)
+	go a.listen(ctx, spotWS, domain.MarketTypeSpot, outChan)
 	return nil
 }
 
-// ConnectFutures подключается к WebSocket фьючерсного рынка Binance и транслирует тикеры в outChan
 func (a *Adapter) ConnectFutures(ctx context.Context, outChan chan<- domain.MarketTick) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	go a.listenToStream(ctx, binanceFuturesWS, domain.MarketTypeFutures, outChan)
+	go a.listen(ctx, futuresWS, domain.MarketTypeFutures, outChan)
 	return nil
 }
 
-// listenToStream отвечает за жизненный цикл соединения: подключение, чтение и авто-переподключение
-func (a *Adapter) listenToStream(ctx context.Context, wsURL string, marketType domain.MarketType, outChan chan<- domain.MarketTick) {
+func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
+	go a.listenFunding(ctx, sink)
+	return nil
+}
+
+func (a *Adapter) listen(ctx context.Context, url string, mType domain.MarketType, outChan chan<- domain.MarketTick) {
 	for {
-		select {
-		case <-ctx.Done():
-			log.Printf("🛑 Остановка потока %s по контексту", marketType)
-			return
-		default:
-		}
-
-		err := a.connectAndRead(ctx, wsURL, marketType, outChan)
-
-		// Если ошибка возникла из-за отмены контекста, просто выходим
 		if ctx.Err() != nil {
 			return
 		}
-
+		err := a.connectAndRead(ctx, url, mType, outChan)
+		if ctx.Err() != nil {
+			return
+		}
 		if err != nil {
-			log.Printf("⚠️ Ошибка в потоке %s: %v. Переподключение через %v...", marketType, err, reconnectDelay)
-			// Ждем перед переподключением, но прерываем ожидание, если контекст отменен
+			log.Printf("⚠️ Binance %s WS error: %v. Reconnecting...", mType, err)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(reconnectDelay):
+			case <-time.After(3 * time.Second):
 			}
 		}
 	}
 }
 
-// connectAndRead устанавливает соединение и читает сообщения до момента ошибки или отмены контекста
-func (a *Adapter) connectAndRead(ctx context.Context, wsURL string, marketType domain.MarketType, outChan chan<- domain.MarketTick) error {
-	dialer := websocket.Dialer{
-		HandshakeTimeout: dialTimeout,
-	}
-
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+func (a *Adapter) connectAndRead(ctx context.Context, url string, mType domain.MarketType, outChan chan<- domain.MarketTick) error {
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	conn, _, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return fmt.Errorf("ошибка подключения к %s WS: %w", marketType, err)
+		return fmt.Errorf("dial error: %w", err)
 	}
 	defer conn.Close()
 
-	log.Printf("✅ Успешное подключение к WebSocket Binance %s", marketType)
-
-	// Горутина для принудительного закрытия соединения при отмене контекста.
-	// Это необходимо, чтобы разблокировать зависший conn.ReadMessage()
-	go func() {
-		<-ctx.Done()
-		conn.Close()
-	}()
+	log.Printf("✅ Connected to Binance %s", mType)
+	go func() { <-ctx.Done(); conn.Close() }()
 
 	for {
-		_, message, err := conn.ReadMessage()
+		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil // Чистый выход по контексту
+				return nil
 			}
-			return fmt.Errorf("ошибка чтения WS %s: %w", marketType, err)
+			return err
 		}
 
-		// Парсим JSON байты в структуру
-		var wsTick binanceBookTickerWS
-		if err := json.Unmarshal(message, &wsTick); err != nil {
-			continue // Игнорируем битые/нестандартные сообщения
-		}
-
-		// Парсим строковые цены в точные Decimal
-		bid, errBid := decimal.NewFromString(wsTick.BestBid)
-		ask, errAsk := decimal.NewFromString(wsTick.BestAsk)
-		if errBid != nil || errAsk != nil {
+		var p tickerPayload
+		if err := sonic.Unmarshal(msg, &p); err != nil {
 			continue
 		}
 
-		// Преобразуем в единую доменную модель
-		tick := domain.MarketTick{
-			Exchange:   "BINANCE",
-			Symbol:     wsTick.Symbol,
-			MarketType: marketType,
-			BestBid:    bid,
-			BestAsk:    ask,
-			Timestamp:  time.Now(),
+		bid, _ := decimal.NewFromString(p.BestBid)
+		ask, _ := decimal.NewFromString(p.BestAsk)
+		qVol, _ := decimal.NewFromString(p.QVolume)
+
+		if bid.IsZero() || ask.IsZero() {
+			continue
 		}
 
-		// Неблокирующая отправка в канал.
-		// Если канал переполнен, мы пропускаем тик, чтобы не блокировать чтение из WebSocket.
+		tick := domain.MarketTick{
+			Exchange: "BINANCE", Symbol: p.Symbol, MarketType: mType,
+			BestBid: bid, BestAsk: ask, QuoteVolume: qVol, Timestamp: time.Now(),
+		}
+
 		select {
 		case outChan <- tick:
-		case <-ctx.Done():
-			return nil
-		default:
-			// Опционально: можно добавить лог, если канал часто переполняется
-			// log.Printf("⚠️ Канал %s переполнен, пропуск тика для %s", marketType, wsTick.Symbol)
+		default: // Drop if channel full to prevent WS blocking
+		}
+	}
+}
+
+func (a *Adapter) listenFunding(ctx context.Context, sink domain.FundingSink) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		err := a.connectAndReadFunding(ctx, sink)
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			log.Printf("⚠️ Binance Funding WS error: %v. Reconnecting...", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+		}
+	}
+}
+
+func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.FundingSink) error {
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	conn, _, err := dialer.DialContext(ctx, fundingWS, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	log.Printf("✅ Connected to Binance Funding Rates")
+	go func() { <-ctx.Done(); conn.Close() }()
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+
+		var payloads []fundingPayload
+		if err := sonic.Unmarshal(msg, &payloads); err != nil {
+			continue
+		}
+
+		for _, p := range payloads {
+			rate, _ := decimal.NewFromString(p.FundingRate)
+			nextTime := time.UnixMilli(p.NextFundingTime)
+			sink.UpdateFunding(p.Symbol, rate, nextTime)
 		}
 	}
 }
