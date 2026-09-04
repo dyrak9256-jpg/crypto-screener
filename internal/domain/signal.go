@@ -7,19 +7,21 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+type SpreadType string
+
 const (
 	CrossExchange SpreadType = "CROSS_EXCHANGE"
 	IntraExchange SpreadType = "INTRA_EXCHANGE"
 )
 
-// Событие SpreadEvent передается от агрегатора к трекеру.
 type SpreadEvent struct {
-	Symbol     string
-	SpreadType SpreadType
-	Spread     decimal.Decimal
-	ExchangeA  string
-	ExchangeB  string
-	Timestamp  time.Time
+	Symbol      string
+	SpreadType  SpreadType
+	Spread      decimal.Decimal
+	ExchangeA   string
+	ExchangeB   string
+	QuoteVolume decimal.Decimal // 24h rolling volume для базовой оценки
+	Timestamp   time.Time
 }
 
 type ArbitrageSignal struct {
@@ -35,19 +37,15 @@ type ArbitrageSignal struct {
 	PeakSpread    decimal.Decimal
 	FinalSpread   decimal.Decimal
 	Duration      time.Duration
+	QuoteVolume   decimal.Decimal
 }
 
 func NewArbitrageSignal(event SpreadEvent, ts time.Time) *ArbitrageSignal {
 	return &ArbitrageSignal{
-		ID:            uuid.NewString(),
-		Symbol:        event.Symbol,
-		SpreadType:    event.SpreadType,
-		ExchangeA:     event.ExchangeA,
-		ExchangeB:     event.ExchangeB,
-		OpenedAt:      ts,
-		IsActive:      true,
-		InitialSpread: event.Spread,
-		PeakSpread:    event.Spread,
+		ID: uuid.NewString(), Symbol: event.Symbol, SpreadType: event.SpreadType,
+		ExchangeA: event.ExchangeA, ExchangeB: event.ExchangeB, OpenedAt: ts,
+		IsActive: true, InitialSpread: event.Spread, PeakSpread: event.Spread,
+		QuoteVolume: event.QuoteVolume,
 	}
 }
 

@@ -1,9 +1,10 @@
 package app
 
 import (
-	"crypto-screener/internal/domain"
 	"sync"
 	"time"
+
+	"crypto-screener/internal/domain"
 
 	"github.com/shopspring/decimal"
 )
@@ -15,7 +16,10 @@ type FundingManager struct {
 }
 
 func NewFundingManager(cfg *domain.ScreenerConfig) *FundingManager {
-	return &FundingManager{rates: make(map[string]*domain.FundingRate), config: cfg}
+	return &FundingManager{
+		rates:  make(map[string]*domain.FundingRate),
+		config: cfg,
+	}
 }
 
 func (fm *FundingManager) UpdateFunding(symbol string, rate decimal.Decimal, nextTime time.Time) {
@@ -27,18 +31,21 @@ func (fm *FundingManager) UpdateFunding(symbol string, rate decimal.Decimal, nex
 func (fm *FundingManager) IsArbProfitable(symbol string, spread decimal.Decimal, now time.Time) bool {
 	fm.mu.RLock()
 	defer fm.mu.RUnlock()
+
 	fr, exists := fm.rates[symbol]
 	if !exists {
 		return true
 	}
 
 	minutesUntilFunding := fr.NextFundingTime.Sub(now).Minutes()
-	if minutesUntilFunding < float64(fm.config.GetHardMinSpread()) {
+
+	if minutesUntilFunding < float64(fm.config.GetFundingTimeBuffer()) {
 		return false
-	} // Simplified buffer check
+	}
 
 	if fr.Rate.Abs().GreaterThanOrEqual(spread) {
 		return false
 	}
+
 	return true
 }

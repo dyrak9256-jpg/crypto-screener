@@ -18,7 +18,8 @@ type FundingSink interface {
 }
 
 type TelegramSender interface {
-	SendMessage(text string)
+	SendPrivateMessage(chatID int64, text string)
+	Broadcast(text string, chatIDs []int64)
 	Close()
 }
 
@@ -26,6 +27,16 @@ type SignalRepository interface {
 	SaveSignal(ctx context.Context, signal *ArbitrageSignal) error
 }
 
+type UserRepository interface {
+	SaveUser(ctx context.Context, user *User) error
+	DeleteUser(ctx context.Context, chatID int64) error
+	GetAllUsers(ctx context.Context) ([]*User, error)
+}
+
 type CommandHandler interface {
-	HandleCommand(cmd string, args []string) string
+	HandleCommand(chatID int64, username string, cmd string, args []string) string
+}
+
+type VolumeProvider interface {
+	GetSymbolVolume(symbol string, tf Timeframe, ts time.Time) decimal.Decimal
 }

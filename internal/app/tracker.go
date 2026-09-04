@@ -1,12 +1,9 @@
 package app
 
 import (
-	"crypto-screener/internal/domain"
-	"fmt"
 	"sync"
-	"time"
 
-	"github.com/shopspring/decimal"
+	"crypto-screener/internal/domain"
 )
 
 type Tracker struct {
@@ -14,17 +11,16 @@ type Tracker struct {
 	activeSignals map[string]*domain.ArbitrageSignal
 	config        *domain.ScreenerConfig
 	dbChan        chan<- *domain.ArbitrageSignal
-	telegram      domain.TelegramSender
+	router        *NotificationRouter
 }
 
-func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSignal) *Tracker {
-	return &Tracker{activeSignals: make(map[string]*domain.ArbitrageSignal), config: cfg, dbChan: dbChan}
-}
-
-func (t *Tracker) SetTelegramSender(tg domain.TelegramSender) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.telegram = tg
+func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSignal, router *NotificationRouter) *Tracker {
+	return &Tracker{
+		activeSignals: make(map[string]*domain.ArbitrageSignal),
+		config:        cfg,
+		dbChan:        dbChan,
+		router:        router,
+	}
 }
 
 func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
@@ -42,33 +38,28 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 
 	if exists {
 		signal.UpdatePeak(event.Spread)
+
 		if event.Spread.LessThanOrEqual(closeThreshold) {
 			signal.Close(event.Timestamp, event.Spread)
 			delete(t.activeSignals, key)
+
 			select {
 			case t.dbChan <- signal:
 			default:
 			}
 
-			if t.telegram != nil {
-				msg := fmt.Sprintf("✅ *SIGNAL CLOSED*\nSymbol: `%s`\nType: %s\nPeak: %s%%\nFinal: %s%%\nDuration: %s",
-					signal.Symbol, signal.SpreadType,
-					signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(2),
-					signal.FinalSpread.Mul(decimal.NewFromInt(100)).StringFixed(2),
-					signal.Duration.Round(time.Second))
-				t.telegram.SendMessage(msg)
+			// Уведомляем роутер о закрытии
+			if t.router != nil {
+				go t.router.ProcessSignal(signal, false)
 			}
 		}
 	} else {
 		newSignal := domain.NewArbitrageSignal(event, event.Timestamp)
 		t.activeSignals[key] = newSignal
 
-		if t.telegram != nil {
-			msg := fmt.Sprintf("🚨 *SIGNAL OPENED*\nSymbol: `%s`\nType: %s\nExchanges: %s vs %s\nSpread: %s%%\nTime: %s",
-				newSignal.Symbol, newSignal.SpreadType, newSignal.ExchangeA, newSignal.ExchangeB,
-				newSignal.InitialSpread.Mul(decimal.NewFromInt(100)).StringFixed(2),
-				newSignal.OpenedAt.Format(time.RFC3339))
-			t.telegram.SendMessage(msg)
+		// Уведомляем роутер об открытии
+		if t.router != nil {
+			go t.router.ProcessSignal(newSignal, true)
 		}
 	}
 }

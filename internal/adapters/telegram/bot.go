@@ -2,52 +2,67 @@ package telegram
 
 import (
 	"context"
-	"crypto-screener/internal/domain"
 	"log"
 	"strings"
+
+	"crypto-screener/internal/domain"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 type Bot struct {
 	api        *tgbotapi.BotAPI
-	chatID     int64
-	sendChan   chan string
+	sendChan   chan tgbotapi.Chattable
 	cmdHandler domain.CommandHandler
 }
 
-func NewBot(token string, chatID int64, handler domain.CommandHandler) (*Bot, error) {
+func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
 	api, err := tgbotapi.NewBotAPI(token)
 	if err != nil {
 		return nil, err
 	}
 
 	b := &Bot{
-		api: api, chatID: chatID, cmdHandler: handler,
-		sendChan: make(chan string, 5000),
+		api:        api,
+		cmdHandler: handler,
+		sendChan:   make(chan tgbotapi.Chattable, 10000), // Увеличили буфер для рассылок
 	}
 	go b.sendWorker()
 	return b, nil
 }
 
 func (b *Bot) sendWorker() {
-	for text := range b.sendChan {
-		msg := tgbotapi.NewMessage(b.chatID, text)
-		msg.ParseMode = "Markdown"
+	for msg := range b.sendChan {
 		if _, err := b.api.Send(msg); err != nil {
 			log.Printf("⚠️ Telegram send error: %v", err)
 		}
 	}
 }
 
-func (b *Bot) SendMessage(text string) {
+func (b *Bot) SendPrivateMessage(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "Markdown"
 	select {
-	case b.sendChan <- text:
+	case b.sendChan <- msg:
 	default:
 	}
 }
 
-func (b *Bot) Close() { close(b.sendChan) }
+func (b *Bot) Broadcast(text string, chatIDs []int64) {
+	for _, id := range chatIDs {
+		msg := tgbotapi.NewMessage(id, text)
+		msg.ParseMode = "Markdown"
+		select {
+		case b.sendChan <- msg:
+		default:
+			// Если канал переполнен, пропускаем, чтобы не блокировать роутер
+		}
+	}
+}
+
+func (b *Bot) Close() {
+	close(b.sendChan)
+}
 
 func (b *Bot) StartPolling(ctx context.Context) {
 	u := tgbotapi.NewUpdate(0)
@@ -62,18 +77,26 @@ func (b *Bot) StartPolling(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if update.Message == nil || !update.Message.IsCommand() {
+			if update.Message == nil {
 				continue
 			}
 
-			cmd := update.Message.Command()
-			args := []string{}
-			if update.Message.CommandArguments() != "" {
-				args = strings.Fields(update.Message.CommandArguments())
+			chatID := update.Message.Chat.ID
+			username := update.Message.From.UserName
+			if username == "" {
+				username = update.Message.Chat.UserName
 			}
 
-			response := b.cmdHandler.HandleCommand(cmd, args)
-			b.SendMessage(response)
+			if update.Message.IsCommand() {
+				cmd := update.Message.Command()
+				args := []string{}
+				if update.Message.CommandArguments() != "" {
+					args = strings.Fields(update.Message.CommandArguments())
+				}
+
+				response := b.cmdHandler.HandleCommand(chatID, username, cmd, args)
+				b.SendPrivateMessage(chatID, response)
+			}
 		}
 	}
 }
