@@ -16,11 +16,17 @@ const (
 
 // MarketTick — единый нормализованный тикер цен с биржи
 type MarketTick struct {
-	Exchange   string          // Название биржи ("BINANCE", "BYBIT")
-	Symbol     string          // Торговая пара ("BTCUSDT")
-	MarketType MarketType      // SPOT или FUTURES
-	BestBid    decimal.Decimal // Лучшая цена покупки (по ней продаем)
-	BestAsk    decimal.Decimal // Лучшая цена продажи (по ней покупаем)
-	Volume24h  decimal.Decimal // Суточный объем с биржи в USD (для отсева неликвида)
-	Timestamp  time.Time       // Время получения события
+	Exchange    string
+	Symbol      string
+	MarketType  MarketType
+	BestBid     decimal.Decimal
+	BestAsk     decimal.Decimal
+	QuoteVolume decimal.Decimal
+	Timestamp   time.Time
+}
+
+type FundingRate struct {
+	Symbol          string
+	Rate            decimal.Decimal
+	NextFundingTime time.Time
 }
