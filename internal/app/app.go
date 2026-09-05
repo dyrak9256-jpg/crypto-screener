@@ -21,6 +21,7 @@ type Application struct {
 	tracker     *Tracker
 	fundingMgr  *FundingManager
 	config      *domain.ScreenerConfig
+	adminIDs    []int64 // Authorized admin chat IDs for privileged commands
 
 	userMgr  *domain.UserManager
 	userRepo domain.UserRepository
@@ -61,6 +62,24 @@ func NewApplication(cfg *domain.ScreenerConfig, repo domain.SignalRepository, us
 func (a *Application) SetTelegramSender(tg domain.TelegramSender) {
 	// Инжектим Telegram в Роутер
 	a.router.telegram = tg
+}
+
+func (a *Application) SetAdminIDs(ids []int64) {
+	a.adminIDs = ids
+}
+
+// isAdmin returns true if chatID is in the admin whitelist.
+// If no admins are configured, all commands are permitted (dev/single-owner mode).
+func (a *Application) isAdmin(chatID int64) bool {
+	if len(a.adminIDs) == 0 {
+		return true
+	}
+	for _, id := range a.adminIDs {
+		if chatID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) error {
@@ -131,6 +150,12 @@ func (a *Application) GetConnectorManager() *ConnectorManager { return a.connMan
 // HandleCommand обрабатывает команды с учетом конкретного пользователя
 func (a *Application) HandleCommand(chatID int64, username string, cmd string, args []string) string {
 	user, exists := a.userMgr.GetUser(chatID)
+
+	// Privileged admin-only commands
+	adminCommands := map[string]bool{"addex": true, "rmex": true}
+	if adminCommands[cmd] && !a.isAdmin(chatID) {
+		return "⛔ Access Denied. You are not authorized to use this command."
+	}
 
 	// Если пользователь не найден, разрешаем только /start
 	if !exists && cmd != "start" {
