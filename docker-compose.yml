@@ -1,29 +1,41 @@
 services:
+  # 1. База данных PostgreSQL
   postgres:
     image: postgres:16-alpine
     container_name: screener_postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: screener_user
-      POSTGRES_PASSWORD: screener_password
-      POSTGRES_DB: screener_db
+      POSTGRES_USER: ${DB_USER:-screener_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-screener_password}
+      POSTGRES_DB: ${DB_NAME:-screener_db}
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      # Автоматически накатывает schema.sql при самом первом старте базы
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U screener_user -d screener_db"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-screener_user} -d ${DB_NAME:-screener_db}"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7-alpine
-    container_name: screener_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redisdata:/data
+  # 2. Ваше Go-приложение (скринер)
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: screener_app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy # Запуск только после полной готовности БД
+    environment:
+      - DATABASE_URL=postgres://${DB_USER:-screener_user}:${DB_PASSWORD:-screener_password}@postgres:5432/${DB_NAME:-screener_db}?sslmode=disable
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - ADMIN_CHAT_IDS=${ADMIN_CHAT_IDS}
+      - HARD_MIN_SPREAD=${HARD_MIN_SPREAD:-0.01}
+      - HARD_MIN_VOLUME=${HARD_MIN_VOLUME:-1000000}
 
 volumes:
   pgdata:
-  redisdata:
