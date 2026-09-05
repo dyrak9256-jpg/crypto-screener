@@ -3,8 +3,11 @@ package bybit
 import (
 	"context"
 	"crypto-screener/internal/domain"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -14,49 +17,57 @@ import (
 
 const (
 	spotWS    = "wss://stream.bybit.com/v5/public/spot"
-	futuresWS = "wss://stream.bybit.com/v5/public/linear" // USDT Perpetual
+	futuresWS = "wss://stream.bybit.com/v5/public/linear"
+
+	spotSymbolsURL    = "https://api.bybit.com/v5/market/instruments-info?category=spot&status=Trading"
+	futuresSymbolsURL = "https://api.bybit.com/v5/market/instruments-info?category=linear&status=Trading"
 
 	handshakeTimeout = 10 * time.Second
-	pingInterval     = 20 * time.Second // Bybit требует ping каждые 20 сек
+	pingInterval     = 20 * time.Second
 	pongWait         = 10 * time.Second
 	reconnectDelay   = 3 * time.Second
+	subBatchSize     = 50 // Bybit принимает макс 50 топиков за раз
 )
 
 var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
-
-// Bybit требует явной подписки на топики
-// tickers.BTCUSDT — но нам нужны ВСЕ символы
-// Bybit не имеет all-tickers stream, используем REST snapshot + WS updates
-// Однако есть tickers топик без символа — получаем все через wildcard
 
 type subscribeMsg struct {
 	Op   string   `json:"op"`
 	Args []string `json:"args"`
 }
 
-// Bybit V5 ticker response
-type wsResponse struct {
-	Topic string        `json:"topic"`
-	Type  string        `json:"type"` // "snapshot" | "delta"
-	Data  tickerPayload `json:"data"`
-}
-
-type tickerPayload struct {
-	Symbol   string `json:"symbol"`
-	Bid1     string `json:"bid1Price"`   // BestBid
-	Ask1     string `json:"ask1Price"`   // BestAsk
-	Volume   string `json:"volume24h"`   // Base volume
-	TurnOver string `json:"turnover24h"` // Quote volume
-}
-
-// Bybit шлёт ping/pong в виде JSON
 type pingMsg struct {
 	Op string `json:"op"`
 }
 
-type Adapter struct{}
+// wsResponse: Data как RawMessage т.к. нужно накладывать delta
+type wsResponse struct {
+	Topic string          `json:"topic"`
+	Type  string          `json:"type"` // "snapshot" | "delta"
+	Data  json.RawMessage `json:"data"`
+}
 
-func NewAdapter() *Adapter { return &Adapter{} }
+// pongResponse: для обработки JSON pong от Bybit
+type pongResponse struct {
+	Op string `json:"op"` // "pong"
+}
+
+type tickerPayload struct {
+	Symbol   string `json:"symbol"`
+	Bid1     string `json:"bid1Price"`
+	Ask1     string `json:"ask1Price"`
+	TurnOver string `json:"turnover24h"`
+}
+
+type Adapter struct {
+	client *http.Client
+}
+
+func NewAdapter() *Adapter {
+	return &Adapter{
+		client: &http.Client{Timeout: 15 * time.Second},
+	}
+}
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
 	go a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
@@ -106,14 +117,35 @@ func (a *Adapter) connectAndRead(
 
 	log.Printf("✅ Bybit %s connected", mType)
 
-	// Подписываемся на все тикеры через wildcard
-	// Bybit поддерживает: "tickers.*"
-	sub := subscribeMsg{
-		Op:   "subscribe",
-		Args: []string{"tickers.*"},
+	// Получаем символы через REST для подписки
+	restURL := futuresSymbolsURL
+	if mType == domain.MarketTypeSpot {
+		restURL = spotSymbolsURL
 	}
-	if err := conn.WriteJSON(sub); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+
+	symbols, err := a.fetchSymbols(ctx, restURL)
+	if err != nil {
+		return fmt.Errorf("fetch symbols: %w", err)
+	}
+
+	log.Printf("📋 Bybit %s: subscribing to %d symbols", mType, len(symbols))
+
+	// Формируем топики
+	args := make([]string, 0, len(symbols))
+	for _, s := range symbols {
+		args = append(args, "tickers."+s)
+	}
+
+	// Отправляем подписку батчами по 50
+	for i := 0; i < len(args); i += subBatchSize {
+		end := i + subBatchSize
+		if end > len(args) {
+			end = len(args)
+		}
+		sub := subscribeMsg{Op: "subscribe", Args: args[i:end]}
+		if err := conn.WriteJSON(sub); err != nil {
+			return fmt.Errorf("subscribe batch [%d:%d]: %w", i, end, err)
+		}
 	}
 
 	connCtx, cancel := context.WithCancel(ctx)
@@ -121,13 +153,16 @@ func (a *Adapter) connectAndRead(
 
 	go closeOnCtx(connCtx, conn)
 
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
-	})
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+	// ✅ НЕ ставим SetPongHandler — Bybit шлёт JSON pong через ReadMessage
+	// Дедлайн сбрасываем при каждом сообщении в цикле
+	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
 
-	// Bybit использует JSON ping {"op":"ping"}, не WS ping frames
 	go bybitKeepAlive(connCtx, conn)
+
+	// ✅ Локальный кэш: накладываем delta на snapshot
+	cache := make(map[string]*tickerPayload, len(symbols))
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -137,6 +172,8 @@ func (a *Adapter) connectAndRead(
 			}
 			return fmt.Errorf("read: %w", err)
 		}
+
+		// Сбрасываем дедлайн при любом входящем сообщении (включая pong)
 		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
 
 		var resp wsResponse
@@ -144,12 +181,40 @@ func (a *Adapter) connectAndRead(
 			continue
 		}
 
-		// Пропускаем служебные сообщения (op responses, pong)
+		// Пропускаем служебные сообщения: pong, ack подписки
 		if resp.Topic == "" {
 			continue
 		}
 
-		tick, ok := toMarketTick(&resp.Data, mType)
+		var delta tickerPayload
+		if err := sonic.Unmarshal(resp.Data, &delta); err != nil {
+			continue
+		}
+
+		if delta.Symbol == "" {
+			continue
+		}
+
+		// ✅ Merge delta в кэш
+		current, exists := cache[delta.Symbol]
+		if !exists {
+			current = &tickerPayload{Symbol: delta.Symbol}
+			cache[delta.Symbol] = current
+		}
+
+		// Обновляем только непустые поля (delta может содержать только часть)
+		if delta.Bid1 != "" {
+			current.Bid1 = delta.Bid1
+		}
+		if delta.Ask1 != "" {
+			current.Ask1 = delta.Ask1
+		}
+		if delta.TurnOver != "" {
+			current.TurnOver = delta.TurnOver
+		}
+
+		// После первого snapshot у нас есть оба значения
+		tick, ok := toMarketTick(current, mType)
 		if !ok {
 			continue
 		}
@@ -161,6 +226,55 @@ func (a *Adapter) connectAndRead(
 		default:
 		}
 	}
+}
+
+// fetchSymbols получает список торгующихся символов через REST
+func (a *Adapter) fetchSymbols(ctx context.Context, url string) ([]string, error) {
+	// Bybit пагинирует по 1000, но обычно всё влезает
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		RetCode int    `json:"retCode"`
+		RetMsg  string `json:"retMsg"`
+		Result  struct {
+			List []struct {
+				Symbol string `json:"symbol"`
+				Status string `json:"status"`
+			} `json:"list"`
+		} `json:"result"`
+	}
+
+	if err := sonic.Unmarshal(body, &parsed); err != nil {
+		return nil, fmt.Errorf("parse response: %w", err)
+	}
+
+	if parsed.RetCode != 0 {
+		return nil, fmt.Errorf("bybit API error %d: %s", parsed.RetCode, parsed.RetMsg)
+	}
+
+	symbols := make([]string, 0, len(parsed.Result.List))
+	for _, item := range parsed.Result.List {
+		// Дополнительная фильтрация — только активные пары
+		if item.Status == "Trading" {
+			symbols = append(symbols, item.Symbol)
+		}
+	}
+
+	return symbols, nil
 }
 
 func toMarketTick(p *tickerPayload, mType domain.MarketType) (domain.MarketTick, bool) {
@@ -187,7 +301,6 @@ func toMarketTick(p *tickerPayload, mType domain.MarketType) (domain.MarketTick,
 	}, true
 }
 
-// Bybit ожидает JSON ping, не WS control frame
 func bybitKeepAlive(ctx context.Context, conn *websocket.Conn) {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
