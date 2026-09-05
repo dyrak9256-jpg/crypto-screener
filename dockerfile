@@ -1,34 +1,23 @@
-# --- Этап 1: Сборка бинарного файла ---
+# Этап 1: Сборка приложения
 FROM golang:1.22-alpine AS builder
-
-# Установка git и ca-certificates (необходимы для скачивания модулей и работы TLS)
-RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 
-# Сначала копируем файлы зависимостей для эффективного кэширования слоев
+RUN apk add --no-cache git ca-certificates
+
+ENV GOTOOLCHAIN=auto
+
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
-# Копируем остальной исходный код
 COPY . .
 
-# Собираем приложение с оптимизациями:
-# CGO_ENABLED=0 для получения статически скомпонованного бинарного файла
-# -ldflags="-s -w" для удаления отладочной информации и уменьшения размера
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /screener cmd/screener/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o screener ./cmd/screener
 
-# --- Этап 2: Создание минимального образа для запуска ---
+# Этап 2: Финальный минимальный образ
 FROM scratch
 
-# Импортируем CA-сертификаты для HTTPS/WebSocket соединений
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/screener /screener
 
-# Копируем бинарный файл из сборщика (builder)
-COPY --from=builder /screener /screener
-
-# Открываем порт метрик на случай добавления Prometheus в будущем (опционально)
-# EXPOSE 8080
-
-# Запуск бинарного файла
 ENTRYPOINT ["/screener"]
