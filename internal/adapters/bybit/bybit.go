@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -22,11 +24,12 @@ const (
 	spotSymbolsURL    = "https://api.bybit.com/v5/market/instruments-info?category=spot&status=Trading"
 	futuresSymbolsURL = "https://api.bybit.com/v5/market/instruments-info?category=linear&status=Trading"
 
-	handshakeTimeout = 10 * time.Second
-	pingInterval     = 20 * time.Second
-	pongWait         = 10 * time.Second
-	reconnectDelay   = 3 * time.Second
-	subBatchSize     = 50 // Bybit принимает макс 50 топиков за раз
+	handshakeTimeout    = 10 * time.Second
+	pingInterval        = 20 * time.Second
+	pongWait            = 10 * time.Second
+	reconnectDelay      = 3 * time.Second
+	spotSubBatchSize    = 10
+	futuresSubBatchSize = 50
 )
 
 var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
@@ -44,6 +47,7 @@ type pingMsg struct {
 type wsResponse struct {
 	Topic string          `json:"topic"`
 	Type  string          `json:"type"` // "snapshot" | "delta"
+	Ts    int64           `json:"ts"`
 	Data  json.RawMessage `json:"data"`
 }
 
@@ -70,21 +74,37 @@ func NewAdapter() *Adapter {
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	return a.connectAndRead(ctx, spotWS, domain.MarketTypeSpot, out)
-}
-
-// ConnectFunding — BYBIT не предоставляет поток ставок финансирования через
-// этот коннектор. Блокируем до завершения контекста, чтобы supervisor-горутина
-// (runWithReconnect) не зациклилась на переподключениях.
-// Отсутствие данных о funding означает, что фильтр по funding остаётся
-// пермиссивным (сигнал считается прибыльным).
-func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
-	<-ctx.Done()
+	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	return a.connectAndRead(ctx, futuresWS, domain.MarketTypeFutures, out)
+	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
+	return nil
+}
+
+func (a *Adapter) listen(
+	ctx context.Context,
+	url string,
+	mType domain.MarketType,
+	out chan<- domain.MarketTick,
+) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := a.connectAndRead(ctx, url, mType, out); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("⚠️  Bybit %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reconnectDelay):
+		}
+	}
 }
 
 func (a *Adapter) connectAndRead(
@@ -97,6 +117,7 @@ func (a *Adapter) connectAndRead(
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
 	log.Printf("✅ Bybit %s connected", mType)
@@ -121,8 +142,12 @@ func (a *Adapter) connectAndRead(
 	}
 
 	// Отправляем подписку батчами по 50
-	for i := 0; i < len(args); i += subBatchSize {
-		end := i + subBatchSize
+	batchSize := futuresSubBatchSize
+	if mType == domain.MarketTypeSpot {
+		batchSize = spotSubBatchSize
+	}
+	for i := 0; i < len(args); i += batchSize {
+		end := i + batchSize
 		if end > len(args) {
 			end = len(args)
 		}
@@ -198,7 +223,11 @@ func (a *Adapter) connectAndRead(
 		}
 
 		// После первого snapshot у нас есть оба значения
-		tick, ok := toMarketTick(current, mType)
+		eventTime := time.Now()
+		if resp.Ts > 0 {
+			eventTime = time.UnixMilli(resp.Ts)
+		}
+		tick, ok := toMarketTick(current, mType, eventTime)
 		if !ok {
 			continue
 		}
@@ -214,97 +243,156 @@ func (a *Adapter) connectAndRead(
 
 // fetchSymbols получает список торгующихся символов через REST
 func (a *Adapter) fetchSymbols(ctx context.Context, url string) ([]string, error) {
-	// Bybit пагинирует по 1000, но обычно всё влезает
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var parsed struct {
-		RetCode int    `json:"retCode"`
-		RetMsg  string `json:"retMsg"`
-		Result  struct {
-			List []struct {
-				Symbol string `json:"symbol"`
-				Status string `json:"status"`
-			} `json:"list"`
-		} `json:"result"`
-	}
-
-	if err := sonic.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("parse response: %w", err)
-	}
-
-	if parsed.RetCode != 0 {
-		return nil, fmt.Errorf("bybit API error %d: %s", parsed.RetCode, parsed.RetMsg)
-	}
-
-	symbols := make([]string, 0, len(parsed.Result.List))
-	for _, item := range parsed.Result.List {
-		// Дополнительная фильтрация — только активные пары
-		if item.Status == "Trading" {
-			symbols = append(symbols, item.Symbol)
+	var symbols []string
+	cursor := ""
+	for {
+		reqURL := url
+		if cursor != "" {
+			reqURL += "&cursor=" + url.QueryEscape(cursor)
 		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := a.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("bybit REST status %s", resp.Status)
+		}
+		var parsed struct {
+			RetCode int    `json:"retCode"`
+			RetMsg  string `json:"retMsg"`
+			Result  struct {
+				List []struct {
+					Symbol string `json:"symbol"`
+					Status string `json:"status"`
+				} `json:"list"`
+				NextPageCursor string `json:"nextPageCursor"`
+			} `json:"result"`
+		}
+		if err := sonic.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("parse response: %w", err)
+		}
+		if parsed.RetCode != 0 {
+			return nil, fmt.Errorf("bybit API error %d: %s", parsed.RetCode, parsed.RetMsg)
+		}
+		for _, item := range parsed.Result.List {
+			if item.Status == "Trading" {
+				symbols = append(symbols, item.Symbol)
+			}
+		}
+		if parsed.Result.NextPageCursor == "" || parsed.Result.NextPageCursor == cursor {
+			break
+		}
+		cursor = parsed.Result.NextPageCursor
 	}
-
 	return symbols, nil
 }
 
-func toMarketTick(p *tickerPayload, mType domain.MarketType) (domain.MarketTick, bool) {
-	bid, err := decimal.NewFromString(p.Bid1)
-	if err != nil || bid.IsZero() {
-		return domain.MarketTick{}, false
+// ConnectCandles subscribes only to 1-minute klines. Higher timeframes are
+// calculated locally from these minute buckets, so the exchange sends no
+// duplicate 5m/15m/30m streams.
+func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
+	for _, market := range []domain.MarketType{domain.MarketTypeSpot, domain.MarketTypeFutures} {
+		go a.runCandleFeed(ctx, sink, market)
 	}
-
-	ask, err := decimal.NewFromString(p.Ask1)
-	if err != nil || ask.IsZero() {
-		return domain.MarketTick{}, false
-	}
-
-	qVol, _ := decimal.NewFromString(p.TurnOver)
-
-	return domain.MarketTick{
-		Exchange:    "BYBIT",
-		Symbol:      p.Symbol,
-		MarketType:  mType,
-		BestBid:     bid,
-		BestAsk:     ask,
-		QuoteVolume: qVol,
-		Timestamp:   time.Now(),
-	}, true
+	<-ctx.Done()
+	return nil
 }
 
-func bybitKeepAlive(ctx context.Context, conn *websocket.Conn) {
-	t := time.NewTicker(pingInterval)
-	defer t.Stop()
+type bybitCandleResponse struct {
+	Topic string `json:"topic"`
+	Ts    int64  `json:"ts"`
+	Data  []struct {
+		Start     int64  `json:"start"`
+		End       int64  `json:"end"`
+		Turnover  string `json:"turnover"`
+		Confirm   bool   `json:"confirm"`
+		Timestamp int64  `json:"timestamp"`
+	} `json:"data"`
+}
 
-	ping, _ := sonic.Marshal(pingMsg{Op: "ping"})
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			if err := conn.WriteMessage(websocket.TextMessage, ping); err != nil {
-				log.Printf("⚠️  Bybit ping error: %v", err)
+func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, market domain.MarketType) {
+	url := futuresWS
+	rest := futuresSymbolsURL
+	batch := futuresSubBatchSize
+	if market == domain.MarketTypeSpot {
+		url = spotWS
+		rest = spotSymbolsURL
+		batch = spotSubBatchSize
+	}
+	for ctx.Err() == nil {
+		symbols, err := a.fetchSymbols(ctx, rest)
+		if err != nil {
+			log.Printf("⚠️ Bybit %s candle symbols: %v", market, err)
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(reconnectDelay):
 			}
+			continue
+		}
+		if err := a.readCandleShard(ctx, sink, url, symbols, market, batch); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️ Bybit %s candle WS: %v", market, err)
 		}
 	}
 }
 
-func closeOnCtx(ctx context.Context, conn *websocket.Conn) {
-	<-ctx.Done()
-	conn.Close()
+func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, url string, symbols []string, market domain.MarketType, batch int) error {
+	conn, _, err := dialer.DialContext(ctx, url, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+	go closeOnCtx(ctx, conn)
+	args := make([]string, 0, len(symbols))
+	for _, s := range symbols {
+		args = append(args, "kline.1."+s)
+	}
+	for i := 0; i < len(args); i += batch {
+		end := i + batch
+		if end > len(args) {
+			end = len(args)
+		}
+		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
+			return err
+		}
+	}
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		var r bybitCandleResponse
+		if sonic.Unmarshal(msg, &r) != nil || len(r.Data) == 0 || r.Topic == "" {
+			continue
+		}
+		parts := strings.Split(r.Topic, ".")
+		if len(parts) != 3 {
+			continue
+		}
+		symbol := parts[2]
+		for _, d := range r.Data {
+			q, err := decimal.NewFromString(d.Turnover)
+			if err != nil || !q.IsPositive() {
+				continue
+			}
+			et := time.UnixMilli(d.Timestamp)
+			if d.Timestamp == 0 {
+				et = time.UnixMilli(r.Ts)
+			}
+			sink.UpdateCandle(domain.MarketCandle{Exchange: "BYBIT", Symbol: symbol, MarketType: market, OpenTime: time.UnixMilli(d.Start), CloseTime: time.UnixMilli(d.End), QuoteVolume: q, EventTime: et, Closed: d.Confirm})
+		}
+	}
 }

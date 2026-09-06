@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"time"
 
@@ -15,8 +16,23 @@ type Repository struct {
 	pool *pgxpool.Pool
 }
 
+//go:embed schema.sql
+var schemaSQL string
+
 func NewRepository(ctx context.Context, dbURL string) (*Repository, error) {
-	pool, err := pgxpool.New(ctx, dbURL)
+	if dbURL == "" {
+		return nil, fmt.Errorf("database URL is empty")
+	}
+	poolCfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse database URL: %w", err)
+	}
+	poolCfg.MaxConns = 20
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 30 * time.Second
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("create pgx pool: %w", err)
 	}
@@ -27,6 +43,10 @@ func NewRepository(ctx context.Context, dbURL string) (*Repository, error) {
 	if err := pool.Ping(ctx); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
+	}
+	if _, err := pool.Exec(ctx, schemaSQL); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("apply database schema: %w", err)
 	}
 
 	return &Repository{pool: pool}, nil
@@ -40,18 +60,16 @@ func (r *Repository) Close() {
 
 func (r *Repository) SaveSignal(ctx context.Context, s *domain.ArbitrageSignal) error {
 	const query = `
-			INSERT INTO signals (
-				id, symbol, spread_type, exchange_a, exchange_b,
-				opened_at, closed_at, is_active,
-				initial_spread, peak_spread, final_spread, duration_ms, quote_volume
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-			ON CONFLICT (id) DO UPDATE SET
-				closed_at     = EXCLUDED.closed_at,
-				is_active     = EXCLUDED.is_active,
-				peak_spread   = EXCLUDED.peak_spread,
-				final_spread  = EXCLUDED.final_spread,
-				duration_ms   = EXCLUDED.duration_ms,
-				quote_volume  = EXCLUDED.quote_volume`
+		INSERT INTO signals (
+			id, symbol, spread_type, exchange_a, exchange_b, buy_exchange, sell_exchange,
+			buy_market, sell_market, opened_at, closed_at, is_active,
+			initial_spread, peak_spread, final_spread, quote_volume, funding_rate, next_funding_at, duration_ms
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+		ON CONFLICT (id) DO UPDATE SET
+			closed_at = EXCLUDED.closed_at, is_active = EXCLUDED.is_active,
+			peak_spread = EXCLUDED.peak_spread, final_spread = EXCLUDED.final_spread,
+			quote_volume = EXCLUDED.quote_volume, funding_rate = EXCLUDED.funding_rate,
+			next_funding_at = EXCLUDED.next_funding_at, duration_ms = EXCLUDED.duration_ms`
 
 	// ✅ Используем *time.Time вместо sql.NullTime
 	// pgx/v5 нативно понимает указатели как NULL
@@ -62,17 +80,11 @@ func (r *Repository) SaveSignal(ctx context.Context, s *domain.ArbitrageSignal) 
 	}
 
 	_, err := r.pool.Exec(ctx, query,
-		s.ID,
-		s.Symbol,
-		string(s.SpreadType),
-		s.ExchangeA,
-		s.ExchangeB,
-		s.OpenedAt,
-		closedAt, // NULL для активных сигналов
-		s.IsActive,
-		s.InitialSpread.String(),
-		s.PeakSpread.String(),
-		s.FinalSpread.String(),
+		s.ID, s.Symbol, string(s.SpreadType),
+		s.ExchangeA, s.ExchangeB, s.BuyExchange, s.SellExchange,
+		string(s.BuyMarket), string(s.SellMarket), s.OpenedAt, closedAt, s.IsActive,
+		s.InitialSpread.String(), s.PeakSpread.String(), s.FinalSpread.String(),
+		s.QuoteVolume.String(), s.FundingRate.String(), nextFundingPtr(s.NextFunding),
 		s.Duration.Milliseconds(),
 		s.QuoteVolume.String(),
 	)
@@ -87,13 +99,14 @@ func (r *Repository) SaveSignal(ctx context.Context, s *domain.ArbitrageSignal) 
 
 func (r *Repository) SaveUser(ctx context.Context, u *domain.User) error {
 	const query = `
-		INSERT INTO users (chat_id, username, min_spread, min_volume, timeframe)
-		VALUES ($1,$2,$3,$4,$5)
+		INSERT INTO users (chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes)
+		VALUES ($1,$2,$3,$4,$5,$6)
 		ON CONFLICT (chat_id) DO UPDATE SET
 			username   = EXCLUDED.username,
 			min_spread = EXCLUDED.min_spread,
 			min_volume = EXCLUDED.min_volume,
-			timeframe  = EXCLUDED.timeframe`
+			timeframe  = EXCLUDED.timeframe,
+			min_funding_minutes = EXCLUDED.min_funding_minutes`
 
 	_, err := r.pool.Exec(ctx, query,
 		u.ChatID,
@@ -101,6 +114,7 @@ func (r *Repository) SaveUser(ctx context.Context, u *domain.User) error {
 		u.MinSpread.String(),
 		u.MinVolume.String(),
 		string(u.Timeframe),
+		u.MinFundingMinutes,
 	)
 	if err != nil {
 		return fmt.Errorf("save user %d: %w", u.ChatID, err)
@@ -119,7 +133,7 @@ func (r *Repository) DeleteUser(ctx context.Context, chatID int64) error {
 
 func (r *Repository) GetAllUsers(ctx context.Context) ([]*domain.User, error) {
 	const query = `
-		SELECT chat_id, username, min_spread, min_volume, timeframe
+		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes
 		FROM users`
 
 	rows, err := r.pool.Query(ctx, query)
@@ -148,6 +162,27 @@ func (r *Repository) GetAllUsers(ctx context.Context) ([]*domain.User, error) {
 	return users, nil
 }
 
+func (r *Repository) GetUserByChatID(ctx context.Context, chatID int64) (*domain.User, error) {
+	const query = `
+		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes
+		FROM users WHERE chat_id = $1`
+
+	rows, err := r.pool.Query(ctx, query, chatID)
+	if err != nil {
+		return nil, fmt.Errorf("query user %d: %w", chatID, err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, fmt.Errorf("query user %d: %w", chatID, err)
+		}
+		return nil, nil // пользователь не найден
+	}
+
+	return scanUser(rows)
+}
+
 // scanUser читает одну строку и возвращает User
 // Выделено отдельно чтобы не дублировать логику в GetAllUsers (и других методах users)
 func scanUser(rows interface {
@@ -162,6 +197,7 @@ func scanUser(rows interface {
 		&spreadStr,
 		&volStr,
 		&u.Timeframe,
+		&u.MinFundingMinutes,
 	); err != nil {
 		return nil, fmt.Errorf("scan user row: %w", err)
 	}
@@ -185,4 +221,11 @@ func scanUser(rows interface {
 	u.MinVolume = minVolume
 
 	return u, nil
+}
+
+func nextFundingPtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }

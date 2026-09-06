@@ -2,10 +2,12 @@ package kucoin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -66,6 +68,9 @@ type tickerData struct {
 	BestAsk      string `json:"bestAsk"`
 	BestBidPrice string `json:"bestBidPrice"`
 	BestAskPrice string `json:"bestAskPrice"`
+	VolValue     string `json:"volValue"`
+	Turnover     string `json:"turnover"`
+	Turnover24h  string `json:"turnover24h"`
 }
 
 type Adapter struct {
@@ -75,21 +80,42 @@ type Adapter struct {
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	return a.connectAndRead(ctx, bulletSpotURL, "/market/ticker:all", domain.MarketTypeSpot, out)
-}
-
-// ConnectFunding — KUCOIN не предоставляет поток ставок финансирования через
-// этот коннектор. Блокируем до завершения контекста, чтобы supervisor-горутина
-// (runWithReconnect) не зациклилась на переподключениях.
-// Отсутствие данных о funding означает, что фильтр по funding остаётся
-// пермиссивным (сигнал считается прибыльным).
-func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
-	<-ctx.Done()
+	a.listen(ctx, domain.MarketTypeSpot, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	return a.connectAndRead(ctx, bulletFuturesURL, "/contractMarket/ticker:all", domain.MarketTypeFutures, out)
+	a.listen(ctx, domain.MarketTypeFutures, out)
+	return nil
+}
+
+func (a *Adapter) listen(ctx context.Context, mType domain.MarketType, out chan<- domain.MarketTick) {
+	bulletURL := bulletSpotURL
+	topic := "/market/ticker:all"
+
+	if mType == domain.MarketTypeFutures {
+		bulletURL = bulletFuturesURL
+		topic = "/contractMarket/ticker:all"
+	}
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if err := a.connectAndRead(ctx, bulletURL, topic, mType, out); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("⚠️  KuCoin %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reconnectDelay):
+		}
+	}
 }
 
 func (a *Adapter) connectAndRead(
@@ -111,6 +137,7 @@ func (a *Adapter) connectAndRead(
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
 	log.Printf("✅ KuCoin %s connected (ping every %s)", mType, pingInterval)
@@ -200,14 +227,28 @@ func toMarketTick(d *tickerData, mType domain.MarketType) (domain.MarketTick, bo
 		return domain.MarketTick{}, false
 	}
 
+	qVolStr := d.VolValue
+	if qVolStr == "" {
+		qVolStr = d.Turnover24h
+	}
+	if qVolStr == "" {
+		qVolStr = d.Turnover
+	}
+	qVol := decimal.Zero
+	if qVolStr != "" {
+		qVol, err = decimal.NewFromString(qVolStr)
+		if err != nil {
+			return domain.MarketTick{}, false
+		}
+	}
+	if bid.GreaterThan(ask) {
+		return domain.MarketTick{}, false
+	}
+	now := time.Now()
 	return domain.MarketTick{
-		Exchange:    "KUCOIN",
-		Symbol:      symbol,
-		MarketType:  mType,
-		BestBid:     bid,
-		BestAsk:     ask,
-		QuoteVolume: decimal.Zero,
-		Timestamp:   time.Now(),
+		Exchange: "KUCOIN", Symbol: symbol, MarketType: mType,
+		BestBid: bid, BestAsk: ask, QuoteVolume: qVol,
+		EventTime: now, ReceivedAt: now,
 	}, true
 }
 
@@ -253,6 +294,9 @@ func getWSEndpoint(ctx context.Context, restURL string) (endpoint, token string,
 		return "", "", 0, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", 0, fmt.Errorf("kucoin REST status %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -305,4 +349,158 @@ func kucoinKeepAlive(ctx context.Context, conn *websocket.Conn, interval time.Du
 func closeOnCtx(ctx context.Context, conn *websocket.Conn) {
 	<-ctx.Done()
 	conn.Close()
+}
+
+func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
+	go a.runCandleFeed(ctx, sink, domain.MarketTypeSpot)
+	go a.runCandleFeed(ctx, sink, domain.MarketTypeFutures)
+	<-ctx.Done()
+	return nil
+}
+
+type kucoinCandleData struct {
+	Symbol  string   `json:"symbol"`
+	Candles []string `json:"candles"`
+	Time    int64    `json:"time"`
+}
+type kucoinCandleMessage struct {
+	Type  string           `json:"type"`
+	Topic string           `json:"topic"`
+	Data  kucoinCandleData `json:"data"`
+}
+type kucoinSymbolsResponse struct {
+	Code string `json:"code"`
+	Data []struct {
+		Symbol        string `json:"symbol"`
+		QuoteCurrency string `json:"quoteCurrency"`
+		EnableTrading bool   `json:"enableTrading"`
+	} `json:"data"`
+}
+type kucoinFuturesSymbolsResponse struct {
+	Code string `json:"code"`
+	Data []struct {
+		Symbol        string `json:"symbol"`
+		QuoteCurrency string `json:"quoteCurrency"`
+	} `json:"data"`
+}
+
+func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, market domain.MarketType) {
+	for ctx.Err() == nil {
+		symbols, err := kucoinCandleSymbols(ctx, market)
+		if err != nil {
+			log.Printf("⚠️ KuCoin %s candle symbols: %v", market, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+			continue
+		}
+		for i := 0; i < len(symbols); i += 100 {
+			end := i + 100
+			if end > len(symbols) {
+				end = len(symbols)
+			}
+			part := append([]string(nil), symbols[i:end]...)
+			if err := a.readCandleShard(ctx, sink, part, market); err != nil && ctx.Err() == nil {
+				log.Printf("⚠️ KuCoin %s candle WS: %v", market, err)
+			}
+		}
+	}
+}
+
+func kucoinCandleSymbols(ctx context.Context, market domain.MarketType) ([]string, error) {
+	url := "https://api.kucoin.com/api/v2/symbols"
+	if market == domain.MarketTypeFutures {
+		url = "https://api-futures.kucoin.com/api/v1/contracts/active"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	r, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	if market == domain.MarketTypeSpot {
+		var x kucoinSymbolsResponse
+		if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+			return nil, err
+		}
+		out := make([]string, 0, len(x.Data))
+		for _, v := range x.Data {
+			if v.EnableTrading && v.QuoteCurrency == "USDT" {
+				out = append(out, v.Symbol)
+			}
+		}
+		return out, nil
+	}
+	var x kucoinFuturesSymbolsResponse
+	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(x.Data))
+	for _, v := range x.Data {
+		if strings.Contains(v.Symbol, "USDT") {
+			out = append(out, v.Symbol)
+		}
+	}
+	return out, nil
+}
+
+func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, symbols []string, market domain.MarketType) error {
+	bullet := bulletSpotURL
+	if market == domain.MarketTypeFutures {
+		bullet = bulletFuturesURL
+	}
+	endpoint, token, ping, err := getWSEndpoint(ctx, bullet)
+	if err != nil {
+		return err
+	}
+	wsURL := fmt.Sprintf("%s?token=%s&connectId=candle-%d", endpoint, token, time.Now().UnixNano())
+	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+	go closeOnCtx(ctx, conn)
+	go kucoinKeepAlive(ctx, conn, ping)
+	for _, sym := range symbols {
+		topic := "/market/candles:" + sym + "_1min"
+		if market == domain.MarketTypeFutures {
+			topic = "/contractMarket/limitCandle:" + sym + "_1min"
+		}
+		if err := conn.WriteJSON(subscribeMsg{ID: fmt.Sprintf("%d", time.Now().UnixNano()), Type: "subscribe", Topic: topic, Response: true}); err != nil {
+			return err
+		}
+	}
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		var r kucoinCandleMessage
+		if sonic.Unmarshal(msg, &r) != nil || r.Type != "message" || len(r.Data.Candles) < 7 {
+			continue
+		}
+		start, err := strconv.ParseInt(r.Data.Candles[0], 10, 64)
+		if err != nil {
+			continue
+		}
+		vol, err := decimal.NewFromString(r.Data.Candles[6])
+		if err != nil || !vol.IsPositive() {
+			continue
+		}
+		et := time.Now()
+		if r.Data.Time > 0 {
+			et = time.Unix(0, r.Data.Time*int64(time.Microsecond))
+		}
+		sym := strings.ReplaceAll(r.Data.Symbol, "-", "")
+		sink.UpdateCandle(domain.MarketCandle{Exchange: "KUCOIN", Symbol: sym, MarketType: market, OpenTime: time.Unix(start, 0), CloseTime: time.Unix(start, 0).Add(time.Minute - time.Millisecond), QuoteVolume: vol, EventTime: et})
+	}
 }

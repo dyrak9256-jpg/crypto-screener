@@ -5,328 +5,209 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"crypto-screener/internal/domain"
 )
 
-// connectorEntry инкапсулирует весь жизненный цикл одного коннектора.
-// Неизменяема после создания — все поля устанавливаются в конструкторе.
 type connectorEntry struct {
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
-	stopped chan struct{} // закрывается когда все горутины завершены
+	stopped chan struct{}
 }
 
-// newConnectorEntry создаёт запись и сразу запускает supervisor-горутины.
-func newConnectorEntry(
-	ctx context.Context,
-	name string,
-	conn domain.ExchangeConnector,
-	tickChan chan<- domain.MarketTick,
-	fundingSink domain.FundingSink,
-) *connectorEntry {
+func newConnectorEntry(ctx context.Context, name string, conn domain.ExchangeConnector, tickChan chan<- domain.MarketTick, fundingSink domain.FundingSink, candleSink domain.CandleSink) *connectorEntry {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	entryCtx, cancel := context.WithCancel(ctx)
+	e := &connectorEntry{cancel: cancel, stopped: make(chan struct{})}
 
-	e := &connectorEntry{
-		cancel:  cancel,
-		stopped: make(chan struct{}),
+	start := func(label string, fn func(context.Context) error) {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			if err := fn(entryCtx); err != nil && entryCtx.Err() == nil {
+				log.Printf("⚠️ [%s/%s] stopped with error: %v", name, label, err)
+			}
+		}()
 	}
-
-	streams := []struct {
-		suffix    string
-		connectFn func(context.Context) error
-	}{
-		{
-			suffix: "Spot",
-			connectFn: func(c context.Context) error {
-				return conn.ConnectSpot(c, tickChan)
-			},
-		},
-		{
-			suffix: "Futures",
-			connectFn: func(c context.Context) error {
-				return conn.ConnectFutures(c, tickChan)
-			},
-		},
-		{
-			suffix: "Funding",
-			connectFn: func(c context.Context) error {
-				return conn.ConnectFunding(c, fundingSink)
-			},
-		},
+	start("Spot", func(ctx context.Context) error { return conn.ConnectSpot(ctx, tickChan) })
+	start("Futures", func(ctx context.Context) error { return conn.ConnectFutures(ctx, tickChan) })
+	if cc, ok := conn.(domain.CandleConnector); ok && candleSink != nil {
+		start("Candles", func(ctx context.Context) error { return cc.ConnectCandles(ctx, candleSink) })
 	}
-
-	e.wg.Add(len(streams))
-
-	for _, s := range streams {
-		s := s // захват переменной цикла
-		streamName := fmt.Sprintf("%s/%s", name, s.suffix)
-		go runWithReconnect(entryCtx, &e.wg, streamName, s.connectFn)
+	if fc, ok := conn.(domain.FundingConnector); ok && fundingSink != nil {
+		start("Funding", func(ctx context.Context) error { return fc.ConnectFunding(ctx, fundingSink) })
 	}
-
-	// Отдельная горутина сигнализирует о полной остановке.
-	// Это позволяет использовать как wg.Wait() так и select/chan.
-	go func() {
-		e.wg.Wait()
-		close(e.stopped)
-	}()
-
+	go func() { e.wg.Wait(); close(e.stopped) }()
 	return e
 }
 
-// stop отменяет контекст и ожидает завершения всех горутин
-// с таймаутом для защиты от зависания.
 func (e *connectorEntry) stop(timeout time.Duration) error {
 	e.cancel()
-
+	if timeout <= 0 {
+		<-e.stopped
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case <-e.stopped:
 		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("connector stop timed out after %v", timeout)
+	case <-timer.C:
+		return fmt.Errorf("stop timed out after %v", timeout)
 	}
 }
 
-// ConnectorManager управляет пулом биржевых коннекторов.
-// Потокобезопасен. Поддерживает Hot-Swap и Graceful Shutdown.
 type ConnectorManager struct {
-	// mu защищает только connectors и stopped.
-	// Долгие операции (stop, wg.Wait) выполняются БЕЗ удержания мьютекса.
-	mu      sync.Mutex
-	entries map[string]*connectorEntry
-
-	// stopped — флаг завершения работы менеджера.
-	// После StopAll() добавление новых коннекторов запрещено.
-	stopped bool
-
-	// stopTimeout — максимальное время ожидания остановки одного коннектора.
+	lifecycleMu sync.Mutex
+	mu          sync.RWMutex
+	entries     map[string]*connectorEntry
+	stopped     bool
+	stopOnce    sync.Once
+	stopDone    chan struct{}
+	stopErr     error
 	stopTimeout time.Duration
-
 	tickChan    chan<- domain.MarketTick
 	fundingSink domain.FundingSink
+	candleSink  domain.CandleSink
 }
 
-// ConnectorManagerOption — функциональная опция для конфигурации.
 type ConnectorManagerOption func(*ConnectorManager)
 
 func WithStopTimeout(d time.Duration) ConnectorManagerOption {
 	return func(cm *ConnectorManager) {
-		cm.stopTimeout = d
+		if d > 0 {
+			cm.stopTimeout = d
+		}
 	}
 }
 
-func NewConnectorManager(
-	tickChan chan<- domain.MarketTick,
-	fundingSink domain.FundingSink,
-	opts ...ConnectorManagerOption,
-) *ConnectorManager {
-	cm := &ConnectorManager{
-		entries:     make(map[string]*connectorEntry),
-		stopTimeout: 15 * time.Second, // разумный дефолт
-		tickChan:    tickChan,
-		fundingSink: fundingSink,
+func NewConnectorManager(tickChan chan<- domain.MarketTick, fundingSink domain.FundingSink, extras ...any) *ConnectorManager {
+	var candleSink domain.CandleSink
+	cm := &ConnectorManager{entries: make(map[string]*connectorEntry), stopDone: make(chan struct{}), stopTimeout: 15 * time.Second, tickChan: tickChan, fundingSink: fundingSink}
+	for _, extra := range extras {
+		switch v := extra.(type) {
+		case domain.CandleSink:
+			if candleSink == nil {
+				candleSink = v
+			}
+		case []domain.CandleSink:
+			if len(v) > 0 && candleSink == nil {
+				candleSink = v[0]
+			}
+		case ConnectorManagerOption:
+			if v != nil {
+				v(cm)
+			}
+		}
 	}
-	for _, opt := range opts {
-		opt(cm)
-	}
+	cm.candleSink = candleSink
 	return cm
 }
 
-// ErrManagerStopped возвращается при попытке добавить коннектор
-// после вызова StopAll().
 var ErrManagerStopped = errors.New("connector manager is stopped")
 
-// AddConnector добавляет или заменяет коннектор с именем name.
-// Если коннектор уже существует — корректно останавливает старый (Hot-Swap).
-// Потокобезопасен. Не удерживает мьютекс во время ожидания остановки.
-func (cm *ConnectorManager) AddConnector(
-	name string,
-	conn domain.ExchangeConnector,
-	parentCtx context.Context,
-) error {
-	// Фаза 1: извлекаем старый entry под мьютексом, не блокируя надолго.
+func (cm *ConnectorManager) AddConnector(parentCtx context.Context, name string, conn domain.ExchangeConnector) error {
+	cm.lifecycleMu.Lock()
+	defer cm.lifecycleMu.Unlock()
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return errors.New("connector name is empty")
+	}
+	if conn == nil {
+		return errors.New("connector is nil")
+	}
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+
 	cm.mu.Lock()
 	if cm.stopped {
 		cm.mu.Unlock()
 		return ErrManagerStopped
 	}
 	old := cm.entries[name]
-	// Удаляем из map сразу — новые вызовы не увидят старый entry.
 	delete(cm.entries, name)
 	cm.mu.Unlock()
 
-	// Фаза 2: останавливаем старый entry БЕЗ мьютекса.
-	// Это предотвращает deadlock и не блокирует другие операции с map.
 	if old != nil {
 		if err := old.stop(cm.stopTimeout); err != nil {
-			// Логируем, но продолжаем — старые горутины завершатся сами
-			// по контексту, мы не хотим блокировать Hot-Swap.
-			log.Printf("⚠️  [%s] old connector stop warning: %v", name, err)
+			return fmt.Errorf("stop old connector %q: %w", name, err)
 		}
 	}
-
-	// Фаза 3: создаём новый entry БЕЗ мьютекса (дорогая операция).
-	newEntry := newConnectorEntry(parentCtx, name, conn, cm.tickChan, cm.fundingSink)
-
-	// Фаза 4: атомарно регистрируем новый entry.
+	entry := newConnectorEntry(parentCtx, name, conn, cm.tickChan, cm.fundingSink, cm.candleSink)
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	// Проверяем повторно — пока мы останавливали старый,
-	// мог прийти StopAll() или другой AddConnector для того же имени.
-	if cm.stopped {
-		// Менеджер уже остановлен — немедленно останавливаем только что
-		// созданный entry. Без ожидания, т.к. StopAll уже завершился.
-		go func() {
-			if err := newEntry.stop(cm.stopTimeout); err != nil {
-				log.Printf("⚠️  [%s] late stop warning: %v", name, err)
-			}
-		}()
-		return ErrManagerStopped
-	}
-
-	if existing, conflict := cm.entries[name]; conflict {
-		// Параллельный AddConnector успел записать новый entry.
-		// Останавливаем наш (проигравший гонку) entry.
-		go func() {
-			if err := newEntry.stop(cm.stopTimeout); err != nil {
-				log.Printf("⚠️  [%s] conflict stop warning: %v", name, err)
-			}
-		}()
-		// Возвращаем ошибку — caller должен решить, что делать.
-		_ = existing
-		return fmt.Errorf("connector %q was concurrently replaced, retry if needed", name)
-	}
-
-	cm.entries[name] = newEntry
-	log.Printf("✅ [%s] connector started (Spot/Futures/Funding)", name)
+	cm.entries[name] = entry
+	cm.mu.Unlock()
+	log.Printf("✅ [%s] connector started", name)
 	return nil
 }
 
-// RemoveConnector останавливает и удаляет коннектор.
-// Блокируется до полной остановки (с таймаутом).
 func (cm *ConnectorManager) RemoveConnector(name string) error {
+	cm.lifecycleMu.Lock()
+	defer cm.lifecycleMu.Unlock()
+	name = strings.ToUpper(strings.TrimSpace(name))
+	if name == "" {
+		return errors.New("connector name is empty")
+	}
 	cm.mu.Lock()
-	entry, exists := cm.entries[name]
-	if !exists {
+	if cm.stopped {
+		cm.mu.Unlock()
+		return ErrManagerStopped
+	}
+	entry, ok := cm.entries[name]
+	if !ok {
 		cm.mu.Unlock()
 		return fmt.Errorf("connector %q not found", name)
 	}
 	delete(cm.entries, name)
 	cm.mu.Unlock()
-
-	// Ожидание завершения БЕЗ мьютекса.
 	if err := entry.stop(cm.stopTimeout); err != nil {
-		log.Printf("⚠️  [%s] stop warning: %v", name, err)
-		return err
+		return fmt.Errorf("stop connector %q: %w", name, err)
 	}
-
 	log.Printf("🛑 [%s] connector stopped cleanly", name)
 	return nil
 }
 
-// StopAll корректно останавливает все коннекторы параллельно.
-// После вызова AddConnector вернёт ErrManagerStopped.
-// Идемпотентен.
-func (cm *ConnectorManager) StopAll() {
-	// Атомарно помечаем как остановленный и забираем все entries.
-	cm.mu.Lock()
-	if cm.stopped {
+func (cm *ConnectorManager) StopAll() error {
+	cm.stopOnce.Do(func() {
+		defer close(cm.stopDone)
+		cm.lifecycleMu.Lock()
+		cm.mu.Lock()
+		cm.stopped = true
+		entries := cm.entries
+		cm.entries = make(map[string]*connectorEntry)
 		cm.mu.Unlock()
-		return
-	}
-	cm.stopped = true
-	entries := cm.entries
-	cm.entries = make(map[string]*connectorEntry) // новая пустая map
-	cm.mu.Unlock()
+		cm.lifecycleMu.Unlock()
 
-	// Останавливаем все коннекторы параллельно — без мьютекса.
-	var wg sync.WaitGroup
-	for name, entry := range entries {
-		name, entry := name, entry
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := entry.stop(cm.stopTimeout); err != nil {
-				log.Printf("⚠️  [%s] StopAll warning: %v", name, err)
-			} else {
-				log.Printf("🛑 [%s] stopped", name)
-			}
-		}()
-	}
-
-	wg.Wait()
-	log.Println("✅ ConnectorManager: all connectors stopped")
-}
-
-// runWithReconnect — чистая функция-supervisor без состояния менеджера.
-// Запускается как горутина. Завершается когда ctx отменён.
-// Экспоненциальный backoff сбрасывается при успешном соединении
-// продолжительностью более resetThreshold.
-func runWithReconnect(
-	ctx context.Context,
-	wg *sync.WaitGroup,
-	streamName string,
-	connectFn func(context.Context) error,
-) {
-	defer wg.Done()
-
-	const (
-		initialBackoff = 1 * time.Second
-		maxBackoff     = 30 * time.Second
-		// Если соединение продержалось дольше порога — считаем его
-		// "успешным" и сбрасываем backoff. Это предотвращает ситуацию
-		// когда нестабильное соединение накапливает максимальный backoff.
-		resetThreshold = 10 * time.Second
-	)
-
-	backoff := initialBackoff
-
-	for {
-		// Проверяем отмену ДО попытки подключения.
-		if ctx.Err() != nil {
-			return
+		var wg sync.WaitGroup
+		errs := make(chan error, len(entries))
+		for name, entry := range entries {
+			name, entry := name, entry
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := entry.stop(cm.stopTimeout); err != nil {
+					errs <- fmt.Errorf("%s: %w", name, err)
+				}
+			}()
 		}
-
-		start := time.Now()
-		err := connectFn(ctx)
-		duration := time.Since(start)
-
-		// Проверяем причину завершения connectFn.
-		if ctx.Err() != nil {
-			// Штатное завершение по отмене контекста.
-			// err может быть ненулевым (context.Canceled) — это нормально.
-			return
+		wg.Wait()
+		close(errs)
+		var all []string
+		for err := range errs {
+			all = append(all, err.Error())
 		}
-
-		// connectFn завершилась по иной причине (сетевой сбой, протокольная ошибка).
-		// Сбрасываем backoff если соединение было стабильным.
-		if duration >= resetThreshold {
-			backoff = initialBackoff
+		if len(all) > 0 {
+			cm.stopErr = fmt.Errorf("connector shutdown incomplete: %s", strings.Join(all, "; "))
+		} else {
+			log.Println("✅ ConnectorManager: all connectors stopped")
 		}
-
-		log.Printf("⚠️  Stream [%s] disconnected after %v: %v. Retry in %v...",
-			streamName, duration.Round(time.Millisecond), err, backoff)
-
-		// Ожидаем с возможностью прерывания.
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-
-		// Экспоненциальный рост с ограничением.
-		backoff = min(backoff*2, maxBackoff)
-	}
-}
-
-// min возвращает меньшее из двух Duration.
-// Начиная с Go 1.21 можно использовать встроенный min().
-func min(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
+	})
+	<-cm.stopDone
+	return cm.stopErr
 }

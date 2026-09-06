@@ -1,7 +1,8 @@
 package config
 
 import (
-	"log"
+	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -14,47 +15,48 @@ type Config struct {
 	DatabaseURL   string
 	HardMinSpread decimal.Decimal
 	HardMinVolume decimal.Decimal
-	AdminChatIDs  []int64 // Comma-separated admin IDs from ADMIN_CHAT_IDS env var
+	AdminChatIDs  []int64
 }
 
-func Load() *Config {
-	// Читаем жёсткие пороги с ВАЛИДАЦИЕЙ ошибок парсинга.
-	// Некорректное значение env-переменной не должно молча обнуляться:
-	// нулевой порог отключил бы фильтрацию сигналов. При ошибке — фолбэк на дефолт.
-	hardSpread, err := decimal.NewFromString(getEnv("HARD_MIN_SPREAD", "0.01"))
+func Load() (*Config, error) {
+	hardSpread, err := parseDecimalEnvWithDefault("HARD_MIN_SPREAD", "0.01")
 	if err != nil {
-		log.Printf("⚠️  HARD_MIN_SPREAD = %q is invalid (%v); falling back to 0.01",
-			getEnv("HARD_MIN_SPREAD", "0.01"), err)
-		hardSpread = decimal.RequireFromString("0.01")
+		return nil, err
 	}
-	hardVol, err := decimal.NewFromString(getEnv("HARD_MIN_VOLUME", "1000000"))
+	hardVol, err := parseDecimalEnvWithDefault("HARD_MIN_VOLUME", "1000000")
 	if err != nil {
-		log.Printf("⚠️  HARD_MIN_VOLUME = %q is invalid (%v); falling back to 1000000",
-			getEnv("HARD_MIN_VOLUME", "1000000"), err)
-		hardVol = decimal.RequireFromString("1000000")
+		return nil, err
 	}
-
-	var adminIDs []int64
-	if idsStr := getEnv("ADMIN_CHAT_IDS", ""); idsStr != "" {
-		for _, idStr := range strings.Split(idsStr, ",") {
-			if id, err := strconv.ParseInt(strings.TrimSpace(idStr), 10, 64); err == nil {
-				adminIDs = append(adminIDs, id)
+	db := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if db == "" {
+		return nil, errors.New("DATABASE_URL is required")
+	}
+	var admins []int64
+	if raw := strings.TrimSpace(os.Getenv("ADMIN_CHAT_IDS")); raw != "" {
+		for _, part := range strings.Split(raw, ",") {
+			id, e := strconv.ParseInt(strings.TrimSpace(part), 10, 64)
+			if e != nil {
+				return nil, fmt.Errorf("invalid ADMIN_CHAT_IDS value %q: %w", part, e)
 			}
+			admins = append(admins, id)
 		}
 	}
-
-	return &Config{
-		TelegramToken: getEnv("TELEGRAM_TOKEN", ""),
-		DatabaseURL:   getEnv("DATABASE_URL", "postgres://user:pass@localhost:5432/screener?sslmode=disable"),
-		HardMinSpread: hardSpread,
-		HardMinVolume: hardVol,
-		AdminChatIDs:  adminIDs,
-	}
+	return &Config{TelegramToken: strings.TrimSpace(os.Getenv("TELEGRAM_TOKEN")), DatabaseURL: db, HardMinSpread: hardSpread, HardMinVolume: hardVol, AdminChatIDs: admins}, nil
 }
-
-func getEnv(key, fallback string) string {
-	if value, ok := os.LookupEnv(key); ok {
-		return value
+func parseDecimalEnvWithDefault(key, fallback string) (decimal.Decimal, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		raw = fallback
 	}
-	return fallback
+	v, err := decimal.NewFromString(raw)
+	if err != nil {
+		return decimal.Zero, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	if v.IsNegative() {
+		return decimal.Zero, fmt.Errorf("%s cannot be negative", key)
+	}
+	if key == "HARD_MIN_SPREAD" && v.LessThan(decimal.RequireFromString("0.01")) {
+		return decimal.Zero, fmt.Errorf("%s must be at least 0.01 (1%%)", key)
+	}
+	return v, nil
 }

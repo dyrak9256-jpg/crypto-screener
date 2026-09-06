@@ -1,39 +1,89 @@
-# 🏛 Архитектура системы
+# Architecture
 
-Этот документ подробно описывает внутреннюю архитектуру, шаблоны проектирования и оптимизацию производительности скринера криптовалютного арбитража.
+## Data flow
 
-## 1. Высокоуровневая архитектура: Гексагональная архитектура (Hexagonal Architecture)
-Проект строго следует паттерну **«Порты и Адаптеры» (Гексагональная архитектура)**. 
-- **Ядро (`internal/domain`)**: Не содержит внешних зависимостей. Определяет бизнес-сущности и интерфейсы (Порты).
-- **Приложение (`internal/app`)**: Содержит бизнес-логику, управление состоянием и оркестрацию. Зависит только от интерфейсов Ядра.
-- **Адаптеры (`internal/adapters`)**: Конкретные реализации внешних систем (Binance WebSockets, PostgreSQL, Telegram). 
+WebSocket adapters normalize exchange payloads into `domain.MarketTick`.
 
-## 2. Математический движок: Шардированный агрегатор (Sharded Aggregator)
-Чтобы справляться с экстремальными нагрузками без блокировок (lock contention), система избегает использования единого глобального мьютекса для хранения цен.
-- **Шардинг:** Состояние цен разбито на **1024 шарда** на основе хэша `crc32` от тикера (symbol). Тики для `BTCUSDT` всегда попадают в Шард #42. Это снижает конкуренцию за блокировку в 1024 раза.
-- **Алгоритм Min/Max:** Вместо сравнения каждой биржи со всеми остальными ($O(N^2)$), агрегатор находит абсолютную минимальную и максимальную цену среди всех подключенных бирж для данного тикера ($O(N)$). Спред рассчитывается строго между этими двумя крайними значениями.
-- **Исполняемый спред по bid/ask:** спреды считаются по реальным ценам исполнения (покупка по `ask`, продажа по `bid`), а не по mid-price. Кросс-биржевой спред = `(maxBid − minAsk) / minAsk`; внутрибиржевой берёт положительное (арбитражируемое) направление базиса.
-- **Валидация и свежесть:** входящие тики валидируются (`bid>0`, `ask>0`, `bid≤ask`) и отсеиваются по возрасту (`staleWindow`) — устаревшие/некорректные данные не участвуют в расчёте.
+`MarketTick -> ingress -> symbol-hashed workers -> ShardedAggregator -> lifecycle events -> Tracker -> PostgreSQL + NotificationRouter -> Telegram`
 
-## 3. SaaS Маршрутизатор уведомлений (Notification Router)
-Так как система поддерживает тысячи пользователей с индивидуальными фильтрами, критически важна эффективная рассылка.
-- **Группировка по таймфреймам:** При срабатывании сигнала `NotificationRouter` группирует пользователей по запрошенному ими таймфрейму объема (например, 15м, 1ч). 
-- **Оптимизированный расчет объема:** Он запрашивает у `ShardedAggregator` объем для каждого уникального таймфрейма *только один раз*, а затем фильтрует пользователей внутри этих групп. Это сокращает количество расчетов объема с $O(U)$ до $O(T)$, где $U$ — количество пользователей, а $T$ — количество уникальных таймфреймов (максимум 7).
+## Market-data model
 
-## 4. Жизненный цикл сигнала и трекер (Signal Lifecycle & Tracker)
-Компонент `Tracker` управляет состоянием активных аномалий.
-- **Нормализация состояния:** Ключи сигналов нормализуются в алфавитном порядке (например, `BINANCE:BYBIT` вместо `BYBIT:BINANCE`), чтобы предотвратить дублирование сигналов при развороте рыночных направлений.
-- **Повторное появление:** Когда сигнал закрывается (спред опускается ниже порога), он удаляется из мапы активных сигналов. Если спред снова резко вырастет позже, он будет обработан как совершенно новый сигнал.
+A market state is maintained per:
 
-## 5. Конвейер потока данных (Data Flow Pipeline)
-1. **Сбор данных (Ingestion):** `binance.go` считывает сырые байты -> `sonic` парсит JSON -> `MarketTick` (значимый тип / value type) отправляется в `tickChan`.
-2. **Обработка (Processing):** Пул воркеров читает `tickChan` -> передает в `ShardedAggregator.ProcessTick()`.
-3. **Состояние и математика (State & Math):** Агрегатор обновляет состояние шардов -> рассчитывает спред Min/Max -> проверяет прибыльность с учетом фандинга (Funding) -> отправляет `SpreadEvent` в `trackerChan`.
-4. **Отслеживание (Tracking):** Воркеры трекера читают `trackerChan` -> обновляют пиковые значения сигнала / закрывают сигнал -> отправляют данные в `dbChan` и `NotificationRouter`.
-5. **Маршрутизация и сохранение (Routing & Persistence):** Маршрутизатор фильтрует сигналы по preferences (настройкам) пользователей -> отправляет их в Telegram `sendChan`. Воркер сохранения читает `dbChan` -> записывает данные в Postgres.
+`symbol -> exchange -> market type`
 
-## 6. Оптимизация производительности и параллелизма
-- **Hot Path без выделения памяти (Zero-Allocation Hot Path):** `MarketTick` передается через каналы как **значимый тип (value type)**. Это исключает необходимость в `sync.Pool` и гарантирует отсутствие утечек памяти из-за забытых вызовов `Put()`.
-- **Потеря-свободный конвейер (Lossless Pipeline):** `SpreadEvent` и закрытые сигналы отправляются **блокирующе** (но вне мьютекса на шарде/трекере) — события и сигналы не теряются молча. Приём сырых тиков — буферизованный и эфемерный, отбрасывает только устаревшие тики.
-- **Асинхронный вводы-вывод (Async I/O):** Запись в базу данных и вызовы Telegram API полностью отвязаны от математического движка с помощью буферизованных каналов.
-- **Единый владелец переподключения (Single Reconnect Owner):** Переподключение с экспоненциальным backoff выполняет **только** `ConnectorManager.runWithReconnect`. Адаптеры открывают и читают одно соединение и возвращают ошибку dial/read — внутренних циклов реконнекта в адаптерах нет (нет дублирующихся систем).
+The engine uses executable prices:
+
+- buy = best ask;
+- sell = best bid.
+
+Freshness is bounded by a 5-second TTL. Old ticks cannot overwrite a newer received tick.
+
+## Arbitrage types
+
+### Cross-exchange
+
+Futures vs futures between distinct exchanges. All currently fresh exchange pairs are checked, not only the global min/max pair.
+
+### Intra-exchange
+
+Spot vs futures on the same exchange. Both directions are supported.
+
+Funding is optional by default and direction-aware when a funding feed exists.
+
+## Signal lifecycle
+
+The aggregator maintains active route state and emits only meaningful lifecycle changes:
+
+- `SignalOpened`
+- `SignalUpdated` when a new maximum spread is observed
+- `SignalClosed`
+
+This prevents PostgreSQL and Telegram from receiving every market-data update.
+
+The Tracker serializes lifecycle events and persists immutable snapshots.
+
+## Concurrency
+
+Ticks are dispatched to a fixed number of worker queues using `hash(symbol)`. This preserves processing order for a symbol while allowing parallel processing across unrelated symbols.
+
+Tracker has one worker intentionally: OPEN/CLOSE ordering is more important than parallelism at this stage.
+
+ConnectorManager serializes connector lifecycle operations. Adapters own reconnect loops.
+
+## Persistence
+
+Signals are persisted asynchronously with retry/backoff. A failed database does not silently discard a signal during normal runtime; the persistence worker retries until shutdown.
+
+The database schema is embedded and applied idempotently during startup, so existing Docker volumes do not depend solely on initdb execution.
+
+## Important non-guarantees
+
+This is a market-data screener, not an execution engine. A detected spread is not guaranteed net profit. Fees, slippage, order-book depth, latency and position constraints are not yet part of the PnL model.
+
+Ticker quote volume is rolling 24h volume. Timeframe-specific volume requires a separate trades/kline pipeline.
+
+## Interval-volume pipeline (v3)
+
+```text
+Exchange 1m Candle WS
+        |
+        v
+ CandleConnector
+        |
+        v
+ VolumeEngine
+  - replace current minute
+  - retain 24h buckets
+  - aggregate 1m -> 5m/15m/30m/1h/4h
+        |
+        +----> route prefilter (any active user can qualify)
+        |
+        v
+ Arbitrage route engine
+        |
+        v
+ User-specific volume recheck -> Telegram
+```
+
+The engine deliberately avoids order-book depth and trade-by-trade volume. This keeps the volume feature bounded and predictable under high message rates.

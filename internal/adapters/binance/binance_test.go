@@ -113,11 +113,13 @@ type testFundingSink struct {
 	updates map[string]decimal.Decimal
 }
 
-func (s *testFundingSink) UpdateFunding(exchange string, symbol string, rate decimal.Decimal, nextTime time.Time) {
+func (s *testFundingSink) UpdateFunding(exchange, symbol string, rate decimal.Decimal, nextTime, eventTime time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updates[symbol] = rate
+	return nil
 }
+func (s *testFundingSink) SetStreamHealth(string, bool) {}
 
 func TestBinanceAdapter_FundingPayload_UnmarshalAndDispatch(t *testing.T) {
 	t.Parallel()
@@ -139,7 +141,7 @@ func TestBinanceAdapter_FundingPayload_UnmarshalAndDispatch(t *testing.T) {
 		rate, err := decimal.NewFromString(p.FundingRate)
 		require.NoError(t, err)
 		nextTime := time.UnixMilli(p.NextFundingTime)
-		sink.UpdateFunding("BINANCE", p.Symbol, rate, nextTime)
+		require.NoError(t, sink.UpdateFunding("BINANCE", p.Symbol, rate, nextTime, time.Time{}))
 	}
 
 	sink.mu.Lock()
