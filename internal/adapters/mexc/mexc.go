@@ -2,10 +2,14 @@ package mexc
 
 import (
 	"context"
-	"crypto-screener/internal/domain"
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"crypto-screener/internal/domain"
 
 	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
@@ -18,44 +22,46 @@ const (
 
 	handshakeTimeout = 10 * time.Second
 	pingInterval     = 15 * time.Second
-	pongWait         = 10 * time.Second
+	pongWait         = 20 * time.Second
 	reconnectDelay   = 3 * time.Second
 )
 
-var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+var (
+	dialer         = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+	spotPingMsg    = []byte(`{"method":"PING"}`)
+	futuresPingMsg = []byte(`{"method":"ping"}`)
+	futuresPongMsg = []byte(`{"method":"pong"}`)
+)
 
 type subscribeMsg struct {
 	Method string   `json:"method"`
 	Params []string `json:"params"`
 }
 
-// MEXC Spot ticker
-type spotResponse struct {
-	Channel string         `json:"c"` // "spot@public.miniTicker.v3.api@BTCUSDT"
-	Data    spotTickerData `json:"d"`
-}
-
 type spotTickerData struct {
 	Symbol  string `json:"s"`
-	Bid     string `json:"b"`  // BestBid
-	Ask     string `json:"a"`  // BestAsk
-	QVolume string `json:"qv"` // Quote volume
+	Bid     string `json:"b"`
+	Ask     string `json:"a"`
+	QVolume string `json:"qv"`
 }
 
-// MEXC Futures ticker
 type futuresResponse struct {
 	Channel string            `json:"channel"`
 	Data    futuresTickerData `json:"data"`
 }
 
+// futuresTickerData: bid1/ask1 приходят как float64
+// Используем float64 + конвертацию через strconv для точности
 type futuresTickerData struct {
 	Symbol string  `json:"symbol"`
 	Bid1   float64 `json:"bid1"`
 	Ask1   float64 `json:"ask1"`
-	Volume float64 `json:"volume24"` // Quote volume
+	Volume float64 `json:"volume24"`
 }
 
-type Adapter struct{}
+type Adapter struct {
+	droppedTicks atomic.Uint64
+}
 
 func NewAdapter() *Adapter { return &Adapter{} }
 
@@ -78,7 +84,7 @@ func (a *Adapter) listenSpot(ctx context.Context, out chan<- domain.MarketTick) 
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("⚠️  MEXC Spot WS: %v — reconnecting", err)
+			log.Printf("⚠️  MEXC Spot WS: %v — reconnecting in %s", err, reconnectDelay)
 		}
 		select {
 		case <-ctx.Done():
@@ -97,7 +103,7 @@ func (a *Adapter) listenFutures(ctx context.Context, out chan<- domain.MarketTic
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("⚠️  MEXC Futures WS: %v — reconnecting", err)
+			log.Printf("⚠️  MEXC Futures WS: %v — reconnecting in %s", err, reconnectDelay)
 		}
 		select {
 		case <-ctx.Done():
@@ -110,27 +116,30 @@ func (a *Adapter) listenFutures(ctx context.Context, out chan<- domain.MarketTic
 func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
 	conn, _, err := dialer.DialContext(ctx, spotWS, nil)
 	if err != nil {
-		return fmt.Errorf("dial: %w", err)
+		return fmt.Errorf("dial spot: %w", err)
 	}
 	defer conn.Close()
 
 	log.Printf("✅ MEXC Spot connected")
 
-	// MEXC: подписка на все mini-tickers
 	sub := subscribeMsg{
 		Method: "SUBSCRIPTION",
 		Params: []string{"spot@public.miniTickers.v3.api"},
 	}
 	if err := conn.WriteJSON(sub); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+		return fmt.Errorf("subscribe spot: %w", err)
 	}
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go closeOnCtx(connCtx, conn)
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
-	go mexcKeepAlive(connCtx, conn)
+
+	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+
+	go spotKeepAlive(connCtx, conn)
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -138,15 +147,21 @@ func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick)
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("read: %w", err)
+			return fmt.Errorf("read spot: %w", err)
 		}
+
 		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
 
-		// MEXC шлёт массив тикеров в поле data
+		// MEXC Spot шлёт PONG как TextMessage — не Control Frame
+		// Просто обновляем дедлайн (уже сделано выше) и пропускаем
+		if strings.Contains(string(msg), "PONG") {
+			continue
+		}
+
 		var raw struct {
 			Data []spotTickerData `json:"d"`
 		}
-		if err := sonic.Unmarshal(msg, &raw); err != nil {
+		if err := sonic.Unmarshal(msg, &raw); err != nil || len(raw.Data) == 0 {
 			continue
 		}
 
@@ -161,6 +176,9 @@ func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick)
 			case <-connCtx.Done():
 				return nil
 			default:
+				if n := a.droppedTicks.Add(1); n%1000 == 0 {
+					log.Printf("⚠️  MEXC Spot: dropped %d ticks (channel full)", n)
+				}
 			}
 		}
 	}
@@ -180,15 +198,19 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 		Params: []string{"all"},
 	}
 	if err := conn.WriteJSON(sub); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
+		return fmt.Errorf("subscribe futures: %w", err)
 	}
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	go closeOnCtx(connCtx, conn)
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
-	go mexcKeepAlive(connCtx, conn)
+
+	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+
+	go futuresKeepAlive(connCtx, conn)
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -198,7 +220,17 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 			}
 			return fmt.Errorf("read futures: %w", err)
 		}
+
 		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+
+		// ✅ Отвечаем на серверный ping
+		// Используем conn.WriteMessage — WriteTextMessage не существует в gorilla
+		if strings.Contains(string(msg), `"ping"`) {
+			if err := conn.WriteMessage(websocket.TextMessage, futuresPongMsg); err != nil {
+				return fmt.Errorf("write pong: %w", err)
+			}
+			continue
+		}
 
 		var resp futuresResponse
 		if err := sonic.Unmarshal(msg, &resp); err != nil {
@@ -219,6 +251,9 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 		case <-connCtx.Done():
 			return nil
 		default:
+			if n := a.droppedTicks.Add(1); n%1000 == 0 {
+				log.Printf("⚠️  MEXC Futures: dropped %d ticks (channel full)", n)
+			}
 		}
 	}
 }
@@ -228,15 +263,17 @@ func spotToTick(d *spotTickerData, ts time.Time) (domain.MarketTick, bool) {
 	if err != nil || bid.IsZero() {
 		return domain.MarketTick{}, false
 	}
+
 	ask, err := decimal.NewFromString(d.Ask)
 	if err != nil || ask.IsZero() {
 		return domain.MarketTick{}, false
 	}
+
 	qVol, _ := decimal.NewFromString(d.QVolume)
 
 	return domain.MarketTick{
 		Exchange:    "MEXC",
-		Symbol:      d.Symbol,
+		Symbol:      d.Symbol, // Spot уже в формате BTCUSDT
 		MarketType:  domain.MarketTypeSpot,
 		BestBid:     bid,
 		BestAsk:     ask,
@@ -246,34 +283,66 @@ func spotToTick(d *spotTickerData, ts time.Time) (domain.MarketTick, bool) {
 }
 
 func futuresToTick(d *futuresTickerData) (domain.MarketTick, bool) {
-	if d.Bid1 == 0 || d.Ask1 == 0 {
+	if d.Bid1 <= 0 || d.Ask1 <= 0 {
 		return domain.MarketTick{}, false
 	}
 
+	// ✅ float64 → string → decimal для максимальной точности
+	// strconv.FormatFloat с 'f' и -1 даёт минимальное представление без потерь
+	bid, err := decimal.NewFromString(strconv.FormatFloat(d.Bid1, 'f', -1, 64))
+	if err != nil {
+		return domain.MarketTick{}, false
+	}
+
+	ask, err := decimal.NewFromString(strconv.FormatFloat(d.Ask1, 'f', -1, 64))
+	if err != nil {
+		return domain.MarketTick{}, false
+	}
+
+	vol, _ := decimal.NewFromString(strconv.FormatFloat(d.Volume, 'f', -1, 64))
+
+	// ✅ Нормализация: "BTC_USDT" → "BTCUSDT"
+	symbol := strings.ReplaceAll(d.Symbol, "_", "")
+
 	return domain.MarketTick{
 		Exchange:    "MEXC",
-		Symbol:      d.Symbol,
+		Symbol:      symbol,
 		MarketType:  domain.MarketTypeFutures,
-		BestBid:     decimal.NewFromFloat(d.Bid1),
-		BestAsk:     decimal.NewFromFloat(d.Ask1),
-		QuoteVolume: decimal.NewFromFloat(d.Volume),
+		BestBid:     bid,
+		BestAsk:     ask,
+		QuoteVolume: vol,
 		Timestamp:   time.Now(),
 	}, true
 }
 
-func mexcKeepAlive(ctx context.Context, conn *websocket.Conn) {
+func spotKeepAlive(ctx context.Context, conn *websocket.Conn) {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
-
-	ping, _ := sonic.Marshal(map[string]string{"method": "PING"})
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := conn.WriteMessage(websocket.TextMessage, ping); err != nil {
-				log.Printf("⚠️  MEXC ping error: %v", err)
+			if err := conn.WriteMessage(websocket.TextMessage, spotPingMsg); err != nil {
+				log.Printf("⚠️  MEXC Spot ping error: %v", err)
+				return
+			}
+		}
+	}
+}
+
+func futuresKeepAlive(ctx context.Context, conn *websocket.Conn) {
+	t := time.NewTicker(pingInterval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := conn.WriteMessage(websocket.TextMessage, futuresPingMsg); err != nil {
+				log.Printf("⚠️  MEXC Futures ping error: %v", err)
 				return
 			}
 		}

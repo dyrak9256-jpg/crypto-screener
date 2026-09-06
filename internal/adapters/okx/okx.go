@@ -2,10 +2,13 @@ package okx
 
 import (
 	"context"
-	"crypto-screener/internal/domain"
 	"fmt"
 	"log"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"crypto-screener/internal/domain"
 
 	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
@@ -13,16 +16,18 @@ import (
 )
 
 const (
-	// OKX использует один endpoint для всего
 	wsURL = "wss://ws.okx.com:8443/ws/v5/public"
 
 	handshakeTimeout = 10 * time.Second
-	pingInterval     = 25 * time.Second // OKX требует ping каждые 30 сек
+	pingInterval     = 20 * time.Second
 	pongWait         = 10 * time.Second
 	reconnectDelay   = 3 * time.Second
 )
 
-var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+var (
+	dialer  = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+	pingMsg = []byte("ping")
+)
 
 type subscribeMsg struct {
 	Op   string    `json:"op"`
@@ -35,20 +40,22 @@ type argItem struct {
 	InstType string `json:"instType,omitempty"`
 }
 
-// OKX тикер ответ
 type wsResponse struct {
-	Arg  argItem      `json:"arg"`
-	Data []tickerData `json:"data"`
+	Event string       `json:"event,omitempty"`
+	Arg   argItem      `json:"arg"`
+	Data  []tickerData `json:"data"`
 }
 
 type tickerData struct {
-	InstID    string `json:"instId"`    // "BTC-USDT"
-	BidPx     string `json:"bidPx"`     // BestBid
-	AskPx     string `json:"askPx"`     // BestAsk
-	VolCcy24h string `json:"volCcy24h"` // Quote volume 24h
+	InstID    string `json:"instId"`
+	BidPx     string `json:"bidPx"`
+	AskPx     string `json:"askPx"`
+	VolCcy24h string `json:"volCcy24h"`
 }
 
-type Adapter struct{}
+type Adapter struct {
+	droppedTicks atomic.Uint64
+}
 
 func NewAdapter() *Adapter { return &Adapter{} }
 
@@ -58,7 +65,7 @@ func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick)
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, "SWAP", domain.MarketTypeFutures, out) // SWAP = perpetual futures
+	go a.listen(ctx, "SWAP", domain.MarketTypeFutures, out)
 	return nil
 }
 
@@ -100,7 +107,6 @@ func (a *Adapter) connectAndRead(
 
 	log.Printf("✅ OKX %s connected", mType)
 
-	// OKX подписка на все тикеры по типу инструмента
 	sub := subscribeMsg{
 		Op: "subscribe",
 		Args: []argItem{
@@ -116,12 +122,12 @@ func (a *Adapter) connectAndRead(
 
 	go closeOnCtx(connCtx, conn)
 
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
-	})
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+	// ✅ Нет SetPongHandler — OKX шлёт "pong" как TextMessage
+	// Дедлайн сбрасывается в цикле при каждом сообщении
+	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
 
-	// OKX использует текстовый "ping", ответ "pong"
 	go okxKeepAlive(connCtx, conn)
 
 	for {
@@ -134,13 +140,18 @@ func (a *Adapter) connectAndRead(
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
 
-		// OKX шлёт "pong" как текст
+		// OKX pong приходит как текст — не Control Frame
 		if string(msg) == "pong" {
 			continue
 		}
 
 		var resp wsResponse
 		if err := sonic.Unmarshal(msg, &resp); err != nil {
+			continue
+		}
+
+		// Пропускаем служебные: ack подписки, ошибки
+		if resp.Event != "" || len(resp.Data) == 0 {
 			continue
 		}
 
@@ -155,12 +166,22 @@ func (a *Adapter) connectAndRead(
 			case <-connCtx.Done():
 				return nil
 			default:
+				if n := a.droppedTicks.Add(1); n%1000 == 0 {
+					log.Printf("⚠️  OKX %s: dropped %d ticks (channel full)", mType, n)
+				}
 			}
 		}
 	}
 }
 
 func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.MarketTick, bool) {
+	// Нормализация и фильтрация — до парсинга decimal
+	// Не тратим ресурсы на парсинг если символ нам не нужен
+	symbol, ok := normalizeSymbol(d.InstID, mType)
+	if !ok {
+		return domain.MarketTick{}, false
+	}
+
 	bid, err := decimal.NewFromString(d.BidPx)
 	if err != nil || bid.IsZero() {
 		return domain.MarketTick{}, false
@@ -173,9 +194,6 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 
 	qVol, _ := decimal.NewFromString(d.VolCcy24h)
 
-	// OKX символ "BTC-USDT" → унифицируем в "BTCUSDT"
-	symbol := normalizeSymbol(d.InstID)
-
 	return domain.MarketTick{
 		Exchange:    "OKX",
 		Symbol:      symbol,
@@ -187,20 +205,35 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 	}, true
 }
 
-// "BTC-USDT" → "BTCUSDT", "BTC-USDT-SWAP" → "BTCUSDT"
-func normalizeSymbol(instID string) string {
-	result := make([]byte, 0, len(instID))
-	for i := 0; i < len(instID); i++ {
-		if instID[i] != '-' {
-			result = append(result, instID[i])
+// normalizeSymbol приводит OKX instId к формату BTCUSDT
+//
+// Spot:
+//
+//	"BTC-USDT"       → "BTCUSDT",  true
+//	"BTC-USDC"       → "",         false  (не USDT)
+//	"BTC-DAI"        → "",         false  (не USDT)
+//
+// Futures (SWAP):
+//
+//	"BTC-USDT-SWAP"  → "BTCUSDT",  true
+//	"BTC-USD-SWAP"   → "",         false  (инверсный контракт)
+//	"BTC-USDC-SWAP"  → "",         false  (не USDT)
+func normalizeSymbol(instID string, mType domain.MarketType) (string, bool) {
+	if mType == domain.MarketTypeSpot {
+		if !strings.HasSuffix(instID, "-USDT") {
+			return "", false
 		}
+		return strings.ReplaceAll(instID, "-", ""), true
 	}
-	// Убираем суффикс SWAP если есть
-	s := string(result)
-	if len(s) > 4 && s[len(s)-4:] == "SWAP" {
-		s = s[:len(s)-4]
+
+	// Futures: только USDT perpetual контракты
+	if !strings.HasSuffix(instID, "-USDT-SWAP") {
+		return "", false
 	}
-	return s
+
+	// "BTC-USDT-SWAP" → убираем "-SWAP" → "BTC-USDT" → убираем "-" → "BTCUSDT"
+	s := strings.TrimSuffix(instID, "-SWAP")
+	return strings.ReplaceAll(s, "-", ""), true
 }
 
 func okxKeepAlive(ctx context.Context, conn *websocket.Conn) {
@@ -212,7 +245,7 @@ func okxKeepAlive(ctx context.Context, conn *websocket.Conn) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
+			if err := conn.WriteMessage(websocket.TextMessage, pingMsg); err != nil {
 				log.Printf("⚠️  OKX ping error: %v", err)
 				return
 			}
