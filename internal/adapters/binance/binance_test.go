@@ -159,23 +159,10 @@ func TestBinanceAdapter_PublicConnectMethods(t *testing.T) {
 	tickChan := make(chan domain.MarketTick, 1)
 	sink := &testFundingSink{updates: make(map[string]decimal.Decimal)}
 
-	assert.NoError(t, adapter.ConnectSpot(ctx, tickChan))
-	assert.NoError(t, adapter.ConnectFutures(ctx, tickChan))
-	assert.NoError(t, adapter.ConnectFunding(ctx, sink))
-}
-
-func TestBinanceAdapter_Listen_ContextCancelled(t *testing.T) {
-	t.Parallel()
-
-	adapter := NewAdapter()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Pre-cancelled context
-
-	outChan := make(chan domain.MarketTick, 1)
-	adapter.listen(ctx, "ws://localhost:9999", domain.MarketTypeSpot, outChan)
-
-	sink := &testFundingSink{updates: make(map[string]decimal.Decimal)}
-	adapter.listenFunding(ctx, sink)
+	// Pre-cancelled ctx: Connect* MUST return promptly. A cancelled-ctx dial error is expected.
+	_ = adapter.ConnectSpot(ctx, tickChan)
+	_ = adapter.ConnectFutures(ctx, tickChan)
+	_ = adapter.ConnectFunding(ctx, sink)
 }
 
 func TestBinanceAdapter_ConnectAndRead_DialError(t *testing.T) {
@@ -189,18 +176,6 @@ func TestBinanceAdapter_ConnectAndRead_DialError(t *testing.T) {
 	err := adapter.connectAndRead(ctx, "ws://127.0.0.1:1", domain.MarketTypeSpot, outChan)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "dial:")
-}
-
-func TestBinanceAdapter_Listen_ReconnectionContextDone(t *testing.T) {
-	t.Parallel()
-
-	adapter := NewAdapter()
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer cancel()
-
-	outChan := make(chan domain.MarketTick, 1)
-	// Invalid URL triggers reconnect branch, which exits when ctx times out after 50ms
-	adapter.listen(ctx, "ws://127.0.0.1:1", domain.MarketTypeFutures, outChan)
 }
 
 func TestBinanceAdapter_ConnectAndRead_ChannelFullDrop(t *testing.T) {

@@ -45,45 +45,18 @@ type Adapter struct{}
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
-	return nil
+	return a.connectAndRead(ctx, spotWS, domain.MarketTypeSpot, out)
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
-	return nil
+	return a.connectAndRead(ctx, futuresWS, domain.MarketTypeFutures, out)
 }
 
 func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
-	a.listenFunding(ctx, sink)
-	return nil
+	return a.connectAndReadFunding(ctx, sink)
 }
 
 // --- Ticker ---
-
-func (a *Adapter) listen(
-	ctx context.Context,
-	url string,
-	mType domain.MarketType,
-	out chan<- domain.MarketTick,
-) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectAndRead(ctx, url, mType, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Binance %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
-}
 
 func (a *Adapter) connectAndRead(
 	ctx context.Context,
@@ -172,25 +145,6 @@ func toMarketTick(p *tickerPayload, mType domain.MarketType, ts time.Time) (doma
 }
 
 // --- Funding ---
-
-func (a *Adapter) listenFunding(ctx context.Context, sink domain.FundingSink) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectAndReadFunding(ctx, sink); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Binance Funding WS: %v — reconnecting in %s", err, reconnectDelay)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
-}
 
 func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.FundingSink) error {
 	conn, _, err := dialer.DialContext(ctx, fundingWS, nil)

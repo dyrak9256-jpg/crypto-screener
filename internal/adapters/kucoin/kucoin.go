@@ -75,8 +75,7 @@ type Adapter struct {
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, domain.MarketTypeSpot, out)
-	return nil
+	return a.connectAndRead(ctx, bulletSpotURL, "/market/ticker:all", domain.MarketTypeSpot, out)
 }
 
 // ConnectFunding — KUCOIN не предоставляет поток ставок финансирования через
@@ -90,37 +89,7 @@ func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) e
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, domain.MarketTypeFutures, out)
-	return nil
-}
-
-func (a *Adapter) listen(ctx context.Context, mType domain.MarketType, out chan<- domain.MarketTick) {
-	bulletURL := bulletSpotURL
-	topic := "/market/ticker:all"
-
-	if mType == domain.MarketTypeFutures {
-		bulletURL = bulletFuturesURL
-		topic = "/contractMarket/ticker:all"
-	}
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if err := a.connectAndRead(ctx, bulletURL, topic, mType, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  KuCoin %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
+	return a.connectAndRead(ctx, bulletFuturesURL, "/contractMarket/ticker:all", domain.MarketTypeFutures, out)
 }
 
 func (a *Adapter) connectAndRead(

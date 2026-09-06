@@ -69,8 +69,7 @@ func NewAdapter() *Adapter {
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, "SPOT", domain.MarketTypeSpot, out)
-	return nil
+	return a.connectAndRead(ctx, "SPOT", domain.MarketTypeSpot, out)
 }
 
 // ConnectFunding — BITGET не предоставляет поток ставок финансирования через
@@ -84,34 +83,7 @@ func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) e
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, "USDT-FUTURES", domain.MarketTypeFutures, out)
-	return nil
-}
-
-func (a *Adapter) listen(
-	ctx context.Context,
-	instType string,
-	mType domain.MarketType,
-	out chan<- domain.MarketTick,
-) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if err := a.connectAndRead(ctx, instType, mType, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Bitget %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
+	return a.connectAndRead(ctx, "USDT-FUTURES", domain.MarketTypeFutures, out)
 }
 
 func (a *Adapter) connectAndRead(
