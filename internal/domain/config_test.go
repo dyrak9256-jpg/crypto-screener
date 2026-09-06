@@ -8,17 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// SetUserCrossSpread sets userCrossSpread enforcing hardMinSpread
-func (c *ScreenerConfig) SetUserCrossSpread(val decimal.Decimal) decimal.Decimal {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if val.LessThan(c.hardMinSpread) {
-		val = c.hardMinSpread
-	}
-	c.userCrossSpread = val
-	return val
-}
-
 func TestScreenerConfig_SetUserCrossSpread_EnforcesHardLimit(t *testing.T) {
 	t.Parallel()
 
@@ -88,20 +77,18 @@ func TestScreenerConfig_GetCloseThreshold(t *testing.T) {
 	hardLimit := decimal.RequireFromString("0.01")
 	hardVol := decimal.RequireFromString("1000000")
 
-	t.Run("calculates half of user cross spread", func(t *testing.T) {
+	t.Run("calculates half of hard spread", func(t *testing.T) {
 		t.Parallel()
 		cfg := NewScreenerConfig(hardLimit, hardVol)
-		cfg.SetUserCrossSpread(decimal.RequireFromString("0.04")) // 4% -> close threshold 2%
+		cfg.SetUserCrossSpread(decimal.RequireFromString("0.04")) // user setting does not change lifecycle threshold
 		threshold := cfg.GetCloseThreshold()
 		assert.True(t, threshold.Equal(decimal.RequireFromString("0.02")))
 	})
 
-	t.Run("enforces 0.1% absolute minimum floor", func(t *testing.T) {
+	t.Run("never exceeds the open threshold", func(t *testing.T) {
 		t.Parallel()
-		// If hard limit is very low, e.g. 0.001 (0.1%), half would be 0.0005, which is < 0.001
 		cfg := NewScreenerConfig(decimal.RequireFromString("0.001"), hardVol)
-		cfg.SetUserCrossSpread(decimal.RequireFromString("0.001"))
 		threshold := cfg.GetCloseThreshold()
-		assert.True(t, threshold.Equal(decimal.RequireFromString("0.001")))
+		assert.True(t, threshold.Equal(decimal.RequireFromString("0.0005")))
 	})
 }

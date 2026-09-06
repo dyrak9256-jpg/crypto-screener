@@ -7,14 +7,27 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-type ExchangeConnector interface {
+// MarketConnector provides spot and/or futures market data.
+// Connect methods block until the stream stops or ctx is cancelled.
+type MarketConnector interface {
 	ConnectSpot(ctx context.Context, outChan chan<- MarketTick) error
 	ConnectFutures(ctx context.Context, outChan chan<- MarketTick) error
+}
+
+// FundingConnector is optional: exchanges that do not expose funding data
+// can still be used as market connectors.
+type FundingConnector interface {
 	ConnectFunding(ctx context.Context, sink FundingSink) error
 }
 
+// ExchangeConnector is the common market-data capability.
+type ExchangeConnector interface {
+	MarketConnector
+}
+
 type FundingSink interface {
-	UpdateFunding(symbol string, rate decimal.Decimal, nextTime time.Time)
+	UpdateFunding(exchange, symbol string, rate decimal.Decimal, nextTime, eventTime time.Time) error
+	SetStreamHealth(exchange string, healthy bool)
 }
 
 type TelegramSender interface {

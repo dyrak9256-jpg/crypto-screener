@@ -32,6 +32,10 @@ type ScreenerConfig struct {
 }
 
 func NewScreenerConfig(hardSpread, hardVol decimal.Decimal) *ScreenerConfig {
+	minSpread := decimal.RequireFromString("0.01")
+	if hardSpread.LessThan(minSpread) {
+		hardSpread = minSpread
+	}
 	return &ScreenerConfig{
 		hardMinSpread:     hardSpread,
 		hardMinVolume:     hardVol,
@@ -90,12 +94,37 @@ func (c *ScreenerConfig) GetFundingTimeBuffer() int {
 func (c *ScreenerConfig) GetCloseThreshold() decimal.Decimal {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	close := c.userCrossSpread.Div(decimal.NewFromInt(2))
-	minClose := decimal.NewFromFloat(0.001) // 0.1% absolute minimum
-	if close.LessThan(minClose) {
-		return minClose
+	if c.hardMinSpread.IsNegative() {
+		return decimal.Zero
 	}
-	return close
+	return c.hardMinSpread.Div(decimal.NewFromInt(2))
+}
+
+func (c *ScreenerConfig) SetHardMinSpread(val decimal.Decimal) decimal.Decimal {
+	min := decimal.RequireFromString("0.01")
+	if val.LessThan(min) {
+		val = min
+	}
+	c.mu.Lock()
+	c.hardMinSpread = val
+	if c.userCrossSpread.LessThan(val) {
+		c.userCrossSpread = val
+	}
+	if c.userIntraSpread.LessThan(val) {
+		c.userIntraSpread = val
+	}
+	c.mu.Unlock()
+	return val
+}
+
+func (c *ScreenerConfig) SetUserCrossSpread(val decimal.Decimal) decimal.Decimal {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if val.LessThan(c.hardMinSpread) {
+		val = c.hardMinSpread
+	}
+	c.userCrossSpread = val
+	return val
 }
 
 func (c *ScreenerConfig) IsPairEnabled(symbol string) bool {

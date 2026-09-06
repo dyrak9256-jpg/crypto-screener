@@ -3,8 +3,12 @@ package binance
 import (
 	"context"
 	"crypto-screener/internal/domain"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -28,14 +32,16 @@ var dialer = websocket.Dialer{
 }
 
 type tickerPayload struct {
-	Symbol  string `json:"s"`
-	BestBid string `json:"b"`
-	BestAsk string `json:"a"`
-	QVolume string `json:"q"`
+	Symbol    string `json:"s"`
+	EventTime int64  `json:"E"`
+	BestBid   string `json:"b"`
+	BestAsk   string `json:"a"`
+	QVolume   string `json:"q"`
 }
 
 type fundingPayload struct {
 	Symbol          string `json:"s"`
+	EventTime       int64  `json:"E"`
 	FundingRate     string `json:"r"`
 	NextFundingTime int64  `json:"T"`
 }
@@ -45,18 +51,141 @@ type Adapter struct{}
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
+	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
+	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
-	go a.listenFunding(ctx, sink)
+	a.listenFunding(ctx, sink)
 	return nil
+}
+
+func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
+	for _, spec := range []struct {
+		url, rest string
+		market    domain.MarketType
+	}{
+		{"wss://stream.binance.com:9443/stream", "https://api.binance.com/api/v3/exchangeInfo", domain.MarketTypeSpot},
+		{"wss://fstream.binance.com/stream", "https://fapi.binance.com/fapi/v1/exchangeInfo", domain.MarketTypeFutures},
+	} {
+		go a.runCandleFeed(ctx, sink, spec.url, spec.rest, spec.market)
+	}
+	<-ctx.Done()
+	return nil
+}
+
+type binanceSpotInfo struct {
+	Symbols []struct{ Symbol, Status, QuoteAsset string } `json:"symbols"`
+}
+
+type binanceKlineEnvelope struct {
+	Data binanceKlinePayload `json:"data"`
+}
+type binanceKlinePayload struct {
+	EventTime int64  `json:"E"`
+	Symbol    string `json:"s"`
+	K         struct {
+		Start  int64  `json:"t"`
+		End    int64  `json:"T"`
+		Quote  string `json:"q"`
+		Closed bool   `json:"x"`
+	} `json:"k"`
+}
+
+func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, wsURL, restURL string, market domain.MarketType) {
+	for ctx.Err() == nil {
+		symbols, err := binanceSymbols(ctx, restURL)
+		if err != nil {
+			log.Printf("⚠️ Binance %s candle symbols: %v", market, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+			continue
+		}
+		var wg sync.WaitGroup
+		for i := 0; i < len(symbols); i += 500 {
+			end := i + 500
+			if end > len(symbols) {
+				end = len(symbols)
+			}
+			streams := make([]string, 0, end-i)
+			for _, sym := range symbols[i:end] {
+				streams = append(streams, strings.ToLower(sym)+"@kline_1m")
+			}
+			streamsCopy := append([]string(nil), streams...)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := a.readBinanceCandleShard(ctx, sink, wsURL, streamsCopy, market); err != nil && ctx.Err() == nil {
+					log.Printf("⚠️ Binance %s candle WS: %v", market, err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+}
+
+func binanceSymbols(ctx context.Context, endpoint string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	var x binanceSpotInfo
+	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(x.Symbols))
+	for _, v := range x.Symbols {
+		if v.Status == "TRADING" && v.QuoteAsset == "USDT" {
+			out = append(out, v.Symbol)
+		}
+	}
+	return out, nil
+}
+
+func (a *Adapter) readBinanceCandleShard(ctx context.Context, sink domain.CandleSink, wsURL string, streams []string, market domain.MarketType) error {
+	u := wsURL + "?streams=" + strings.Join(streams, "/")
+	conn, _, err := dialer.DialContext(ctx, u, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+	go closeOnCtx(ctx, conn)
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		var e binanceKlineEnvelope
+		if sonic.Unmarshal(msg, &e) != nil || e.Data.Symbol == "" {
+			continue
+		}
+		q, err := decimal.NewFromString(e.Data.K.Quote)
+		if err != nil || !q.IsPositive() {
+			continue
+		}
+		et := time.UnixMilli(e.Data.EventTime)
+		if e.Data.EventTime == 0 {
+			et = time.Now()
+		}
+		sink.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: e.Data.Symbol, MarketType: market, OpenTime: time.UnixMilli(e.Data.K.Start), CloseTime: time.UnixMilli(e.Data.K.End), QuoteVolume: q, EventTime: et, Closed: e.Data.K.Closed})
+	}
 }
 
 // --- Ticker ---
@@ -96,6 +225,7 @@ func (a *Adapter) connectAndRead(
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
 	log.Printf("✅ Binance %s connected", mType)
@@ -133,7 +263,11 @@ func (a *Adapter) connectAndRead(
 
 		now := time.Now()
 		for i := range payloads {
-			tick, ok := toMarketTick(&payloads[i], mType, now)
+			eventTime := now
+			if payloads[i].EventTime > 0 {
+				eventTime = time.UnixMilli(payloads[i].EventTime)
+			}
+			tick, ok := toMarketTick(&payloads[i], mType, eventTime)
 			if !ok {
 				continue
 			}
@@ -154,11 +288,14 @@ func toMarketTick(p *tickerPayload, mType domain.MarketType, ts time.Time) (doma
 	}
 
 	ask, err := decimal.NewFromString(p.BestAsk)
-	if err != nil || ask.IsZero() {
+	if err != nil || ask.IsZero() || bid.GreaterThan(ask) {
 		return domain.MarketTick{}, false
 	}
 
-	qVol, _ := decimal.NewFromString(p.QVolume)
+	qVol, err := decimal.NewFromString(p.QVolume)
+	if err != nil {
+		return domain.MarketTick{}, false
+	}
 
 	return domain.MarketTick{
 		Exchange:    "BINANCE",
@@ -167,6 +304,8 @@ func toMarketTick(p *tickerPayload, mType domain.MarketType, ts time.Time) (doma
 		BestBid:     bid,
 		BestAsk:     ask,
 		QuoteVolume: qVol,
+		EventTime:   ts,
+		ReceivedAt:  ts,
 		Timestamp:   ts,
 	}, true
 }
@@ -174,6 +313,7 @@ func toMarketTick(p *tickerPayload, mType domain.MarketType, ts time.Time) (doma
 // --- Funding ---
 
 func (a *Adapter) listenFunding(ctx context.Context, sink domain.FundingSink) {
+	sink.SetStreamHealth("BINANCE", false)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -193,10 +333,12 @@ func (a *Adapter) listenFunding(ctx context.Context, sink domain.FundingSink) {
 }
 
 func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.FundingSink) error {
+	sink.SetStreamHealth("BINANCE", false)
 	conn, _, err := dialer.DialContext(ctx, fundingWS, nil)
 	if err != nil {
 		return fmt.Errorf("dial funding: %w", err)
 	}
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
 	log.Printf("✅ Binance Funding connected")
@@ -233,8 +375,18 @@ func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.Funding
 		}
 
 		for _, p := range payloads {
-			rate, _ := decimal.NewFromString(p.FundingRate)
-			sink.UpdateFunding(p.Symbol, rate, time.UnixMilli(p.NextFundingTime))
+			rate, err := decimal.NewFromString(p.FundingRate)
+			if err != nil {
+				log.Printf("⚠️ Binance invalid funding rate for %s: %v", p.Symbol, err)
+				continue
+			}
+			eventTime := time.Time{}
+			if p.EventTime > 0 {
+				eventTime = time.UnixMilli(p.EventTime)
+			}
+			if err := sink.UpdateFunding("BINANCE", p.Symbol, rate, time.UnixMilli(p.NextFundingTime), eventTime); err != nil {
+				log.Printf("⚠️ Binance funding update: %v", err)
+			}
 		}
 	}
 }

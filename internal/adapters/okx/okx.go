@@ -2,8 +2,11 @@ package okx
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,6 +54,7 @@ type tickerData struct {
 	BidPx     string `json:"bidPx"`
 	AskPx     string `json:"askPx"`
 	VolCcy24h string `json:"volCcy24h"`
+	Ts        int64  `json:"ts,string"`
 }
 
 type Adapter struct {
@@ -60,12 +64,12 @@ type Adapter struct {
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, "SPOT", domain.MarketTypeSpot, out)
+	a.listen(ctx, "SPOT", domain.MarketTypeSpot, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, "SWAP", domain.MarketTypeFutures, out)
+	a.listen(ctx, "SWAP", domain.MarketTypeFutures, out)
 	return nil
 }
 
@@ -103,6 +107,7 @@ func (a *Adapter) connectAndRead(
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
 	log.Printf("✅ OKX %s connected", mType)
@@ -157,7 +162,11 @@ func (a *Adapter) connectAndRead(
 
 		now := time.Now()
 		for i := range resp.Data {
-			tick, ok := toMarketTick(&resp.Data[i], mType, now)
+			eventTime := now
+			if resp.Data[i].Ts > 0 {
+				eventTime = time.UnixMilli(resp.Data[i].Ts)
+			}
+			tick, ok := toMarketTick(&resp.Data[i], mType, eventTime)
 			if !ok {
 				continue
 			}
@@ -188,11 +197,14 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 	}
 
 	ask, err := decimal.NewFromString(d.AskPx)
-	if err != nil || ask.IsZero() {
+	if err != nil || ask.IsZero() || bid.GreaterThan(ask) {
 		return domain.MarketTick{}, false
 	}
 
-	qVol, _ := decimal.NewFromString(d.VolCcy24h)
+	qVol, err := decimal.NewFromString(d.VolCcy24h)
+	if err != nil {
+		return domain.MarketTick{}, false
+	}
 
 	return domain.MarketTick{
 		Exchange:    "OKX",
@@ -201,6 +213,8 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 		BestBid:     bid,
 		BestAsk:     ask,
 		QuoteVolume: qVol,
+		EventTime:   ts,
+		ReceivedAt:  ts,
 		Timestamp:   ts,
 	}, true
 }
@@ -256,4 +270,122 @@ func okxKeepAlive(ctx context.Context, conn *websocket.Conn) {
 func closeOnCtx(ctx context.Context, conn *websocket.Conn) {
 	<-ctx.Done()
 	conn.Close()
+}
+
+func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
+	go a.runCandleFeed(ctx, sink, "SPOT", domain.MarketTypeSpot)
+	go a.runCandleFeed(ctx, sink, "SWAP", domain.MarketTypeFutures)
+	<-ctx.Done()
+	return nil
+}
+
+type okxCandleResponse struct {
+	Event string     `json:"event"`
+	Arg   argItem    `json:"arg"`
+	Data  [][]string `json:"data"`
+	Ts    int64      `json:"ts,string"`
+}
+
+type okxInstrument struct {
+	InstID   string `json:"instId"`
+	State    string `json:"state"`
+	QuoteCcy string `json:"quoteCcy"`
+	InstType string `json:"instType"`
+}
+type okxInstrumentResponse struct {
+	Code string          `json:"code"`
+	Data []okxInstrument `json:"data"`
+}
+
+func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, instType string, market domain.MarketType) {
+	for ctx.Err() == nil {
+		symbols, err := okxSymbols(ctx, instType)
+		if err != nil {
+			log.Printf("⚠️ OKX %s candle symbols: %v", market, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+			continue
+		}
+		if err := a.readCandleShard(ctx, sink, instType, symbols, market); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️ OKX %s candle WS: %v", market, err)
+		}
+	}
+}
+
+func okxSymbols(ctx context.Context, instType string) ([]string, error) {
+	u := "https://www.okx.com/api/v5/public/instruments?instType=" + instType
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Body.Close()
+	var x okxInstrumentResponse
+	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(x.Data))
+	for _, v := range x.Data {
+		if v.State == "live" && (instType != "SPOT" || v.QuoteCcy == "USDT") {
+			out = append(out, v.InstID)
+		}
+	}
+	return out, nil
+}
+
+func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, instType string, symbols []string, market domain.MarketType) error {
+	conn, _, err := dialer.DialContext(ctx, "wss://ws.okx.com:8443/ws/v5/business", nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+	go closeOnCtx(ctx, conn)
+	args := make([]argItem, 0, len(symbols))
+	for _, sym := range symbols {
+		args = append(args, argItem{Channel: "candle1m", InstID: sym})
+	}
+	for i := 0; i < len(args); i += 100 {
+		end := i + 100
+		if end > len(args) {
+			end = len(args)
+		}
+		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
+			return err
+		}
+	}
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		var r okxCandleResponse
+		if sonic.Unmarshal(msg, &r) != nil || len(r.Data) == 0 || r.Arg.InstID == "" {
+			continue
+		}
+		for _, d := range r.Data {
+			if len(d) < 7 {
+				continue
+			}
+			start, err := strconv.ParseInt(d[0], 10, 64)
+			if err != nil {
+				continue
+			}
+			q, err := decimal.NewFromString(d[6])
+			if err != nil || !q.IsPositive() {
+				continue
+			}
+			et := time.UnixMilli(r.Ts)
+			sink.UpdateCandle(domain.MarketCandle{Exchange: "OKX", Symbol: strings.ReplaceAll(r.Arg.InstID, "-", ""), MarketType: market, OpenTime: time.UnixMilli(start), CloseTime: time.UnixMilli(start).Add(time.Minute - time.Millisecond), QuoteVolume: q, EventTime: et, Closed: false})
+		}
+	}
 }

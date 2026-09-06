@@ -1,35 +1,57 @@
-# 🚀 Высокопроизводительный скринер криптовалютного арбитража
+# Crypto Arbitrage Screener
 
-Высокопроизводительный скринер криптовалютного арбитража корпоративного уровня, написанный на Go. Он получает рыночные данные в реальном времени через WebSockets от нескольких бирж, рассчитывает межбиржевые и внутрибиржевые спреды, фильтрует убыточные сигналы на основе ставок финансирования (funding rates) и метрик ликвидности, а также отправляет персонализированные уведомления пользователям через Telegram SaaS-бота.
+Backend скринер арбитражных возможностей на Go.
 
-## ✨ Ключевые возможности
+## Что делает
 
-- **Экстремальная пропускная способность:** Спроектирован для обработки 100 000+ WebSocket-сообщений в секунду без скачков нагрузки на сборщик мусора (GC).
-- **Мультибиржевой и мультирыночный анализ:** Одновременно отслеживает спотовые и фьючерсные рынки на нескольких биржах.
-- **Умный расчет спреда:** Использует алгоритм поиска Min/Max со сложностью O(N) вместо попарного сравнения O(N^2) для мгновенного нахождения самого прибыльного арбитражного маршрута.
-- **Фильтр ставок финансирования:** Автоматически игнорирует сигналы, если расходы на ставку финансирования превышают спред или если выплата фандинга должна произойти в ближайшее время.
-- **SaaS Telegram-бот:** Поддерживает работу с несколькими пользователями. Каждый пользователь может настроить минимальный спред, минимальный объем и таймфрейм объема.
-- **Защитные ограничения (Guardrails):** Жестко заданные минимальные пороги гарантируют качество сигналов и защищают систему от спама низколиквидными уведомлениями.
-- **Горячая смена коннекторов:** Добавление и удаление подключений к биржам «на лету» с помощью Telegram-команд без перезапуска приложения.
-- **Корректное завершение работы (Graceful Shutdown):** Гарантирует нулевую потерю данных, отправляя все незавершенные сигналы в PostgreSQL перед выходом.
+- получает BBO/24h volume через WebSocket adapters;
+- нормализует данные разных бирж в единый `MarketTick`;
+- ищет futures/futures между разными биржами;
+- ищет spot/futures внутри одной биржи;
+- защищается от stale/out-of-order quotes;
+- отслеживает OPEN -> peak -> CLOSE;
+- сохраняет lifecycle сигналов в PostgreSQL;
+- отправляет персональные Telegram alerts по пользовательским spread/volume filters;
+- поддерживает hot add/remove connectors для администратора.
 
-## 🛠 Технологический стек
+## Поддерживаемые adapters
 
-- **Язык программирования:** Go 1.22+
-- **База данных:** PostgreSQL 15 (через `pgx/v5`)
-- **JSON-парсер:** `sonic` (от ByteDance) для ультрабыстрого парсинга с минимальным выделением памяти.
-- **Математика:** `shopspring/decimal` для точных финансовых расчетов.
-- **WebSockets:** `gorilla/websocket`.
-- **Telegram:** `telegram-bot-api/v5`.
+BINANCE, BINGX, BITGET, BYBIT, GATEIO, KUCOIN, MEXC, OKX.
 
-## 📦 Установка и настройка
+## Важно
 
-### 1. Предварительные требования
-- Go 1.22 или выше
-- Docker и Docker Compose (для локального запуска PostgreSQL)
-- Токен Telegram-бота (полученный у [@BotFather](https://t.me/BotFather))
+Текущая версия считает rolling 24h quote volume. Настоящие 1m/5m/15m/30m/1h/4h volume filters требуют trade/kline stream и пока не включены.
 
-### 2. Клонирование и настройка
+Funding feed реализован только для Binance. Для остальных бирж funding является optional и не блокирует raw spot/futures detection.
+
+Spread — это executable BBO spread, а не гарантированный PnL: комиссии, slippage, depth, latency и position limits пока не входят в расчёт.
+
+## Запуск
+
+Требуется Go 1.26.4 и Docker/Compose.
+
 ```bash
-git clone <your-repo-url>
-cd crypto-screener
+cp .env.example .env
+# заполнить TELEGRAM_TOKEN, ADMIN_CHAT_IDS, DB_* / DATABASE_URL
+
+docker compose up --build
+```
+
+## Проверка
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./...
+```
+
+Полный test/race/build gate должен выполняться на машине с Go 1.26.4 и доступом к зависимостям.
+
+## Volume commands
+
+`/setvol <USDT>` — minimum quote turnover.
+`/settimeframe <1m|5m|15m|30m|1h|4h|24h>` — interval for the volume filter.
+`/setfundingtime <minutes>` — do not send a notification when the nearest funding is closer than this threshold.
+
+The global spread floor is configured with `HARD_MIN_SPREAD` (minimum 1%). Administrators can also change the runtime value with `/sethardspread <percent>`; this runtime change is not persisted to PostgreSQL yet and will revert to the environment value after restart.

@@ -110,15 +110,28 @@ func (m *MockFundingSink) EXPECT() *MockFundingSinkMockRecorder {
 }
 
 // UpdateFunding mocks base method.
-func (m *MockFundingSink) UpdateFunding(symbol string, rate decimal.Decimal, nextTime time.Time) {
+func (m *MockFundingSink) UpdateFunding(exchange, symbol string, rate decimal.Decimal, nextTime, eventTime time.Time) error {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "UpdateFunding", symbol, rate, nextTime)
+	ret := m.ctrl.Call(m, "UpdateFunding", exchange, symbol, rate, nextTime, eventTime)
+	ret0, _ := ret[0].(error)
+	return ret0
 }
 
 // UpdateFunding indicates an expected call of UpdateFunding.
-func (mr *MockFundingSinkMockRecorder) UpdateFunding(symbol, rate, nextTime any) *gomock.Call {
+func (mr *MockFundingSinkMockRecorder) UpdateFunding(exchange, symbol, rate, nextTime, eventTime any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateFunding", reflect.TypeOf((*MockFundingSink)(nil).UpdateFunding), symbol, rate, nextTime)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateFunding", reflect.TypeOf((*MockFundingSink)(nil).UpdateFunding), exchange, symbol, rate, nextTime, eventTime)
+}
+
+// SetStreamHealth mocks base method.
+func (m *MockFundingSink) SetStreamHealth(exchange string, healthy bool) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetStreamHealth", exchange, healthy)
+}
+
+func (mr *MockFundingSinkMockRecorder) SetStreamHealth(exchange, healthy any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetStreamHealth", reflect.TypeOf((*MockFundingSink)(nil).SetStreamHealth), exchange, healthy)
 }
 
 // MockTelegramSender is a mock of TelegramSender interface.

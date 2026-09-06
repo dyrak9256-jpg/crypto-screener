@@ -7,48 +7,76 @@ import (
 )
 
 type User struct {
-	ChatID    int64
-	Username  string
-	MinSpread decimal.Decimal
-	MinVolume decimal.Decimal
-	Timeframe Timeframe
+	ChatID            int64
+	Username          string
+	MinSpread         decimal.Decimal
+	MinVolume         decimal.Decimal
+	Timeframe         Timeframe
+	MinFundingMinutes int
 }
 
-// UserManager — потокобезопасный in-memory кэш подписчиков
 type UserManager struct {
 	mu    sync.RWMutex
-	users map[int64]*User
+	users map[int64]User
 }
 
 func NewUserManager() *UserManager {
-	return &UserManager{users: make(map[int64]*User)}
+	return &UserManager{users: make(map[int64]User)}
+}
+
+func cloneUser(u *User) User {
+	if u == nil {
+		return User{}
+	}
+	return *u
 }
 
 func (um *UserManager) SetUser(u *User) {
+	if u == nil {
+		return
+	}
 	um.mu.Lock()
-	defer um.mu.Unlock()
-	um.users[u.ChatID] = u
+	um.users[u.ChatID] = cloneUser(u)
+	um.mu.Unlock()
 }
 
 func (um *UserManager) RemoveUser(chatID int64) {
 	um.mu.Lock()
-	defer um.mu.Unlock()
 	delete(um.users, chatID)
+	um.mu.Unlock()
 }
 
 func (um *UserManager) GetUser(chatID int64) (*User, bool) {
 	um.mu.RLock()
-	defer um.mu.RUnlock()
 	u, ok := um.users[chatID]
-	return u, ok
+	um.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	return &u, true
 }
 
-func (um *UserManager) GetAllUsers() []*User {
+// Range visits a point-in-time snapshot of users without exposing internal map pointers.
+// The callback must not retain the supplied pointer after it returns.
+func (um *UserManager) Range(fn func(User) bool) {
+	if fn == nil {
+		return
+	}
 	um.mu.RLock()
 	defer um.mu.RUnlock()
+	for _, u := range um.users {
+		if !fn(u) {
+			return
+		}
+	}
+}
+func (um *UserManager) GetAllUsers() []*User {
+	um.mu.RLock()
 	list := make([]*User, 0, len(um.users))
 	for _, u := range um.users {
-		list = append(list, u)
+		copy := u
+		list = append(list, &copy)
 	}
+	um.mu.RUnlock()
 	return list
 }

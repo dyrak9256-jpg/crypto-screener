@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -51,6 +52,7 @@ type wsResponse struct {
 	Data   []tickerData `json:"data"`
 	Event  string       `json:"event"`
 	Code   string       `json:"code"`
+	Ts     int64        `json:"ts"`
 }
 
 type tickerData struct {
@@ -58,6 +60,7 @@ type tickerData struct {
 	BidPr    string `json:"bidPr"`
 	AskPr    string `json:"askPr"`
 	QuoteVol string `json:"quoteVolume"`
+	Ts       int64  `json:"ts,string"`
 }
 
 type Adapter struct {
@@ -69,12 +72,12 @@ func NewAdapter() *Adapter {
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, "SPOT", domain.MarketTypeSpot, out)
+	a.listen(ctx, "SPOT", domain.MarketTypeSpot, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, "USDT-FUTURES", domain.MarketTypeFutures, out)
+	a.listen(ctx, "USDT-FUTURES", domain.MarketTypeFutures, out)
 	return nil
 }
 
@@ -122,6 +125,7 @@ func (a *Adapter) connectAndRead(
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}
+	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
 	log.Printf("✅ Bitget %s connected (%d symbols)", mType, len(symbols))
@@ -191,7 +195,13 @@ func (a *Adapter) connectAndRead(
 
 		now := time.Now()
 		for i := range resp.Data {
-			tick, ok := toMarketTick(&resp.Data[i], mType, now)
+			eventTime := now
+			if resp.Data[i].Ts > 0 {
+				eventTime = time.UnixMilli(resp.Data[i].Ts)
+			} else if resp.Ts > 0 {
+				eventTime = time.UnixMilli(resp.Ts)
+			}
+			tick, ok := toMarketTick(&resp.Data[i], mType, eventTime)
 			if !ok {
 				continue
 			}
@@ -218,11 +228,14 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 	}
 
 	ask, err := decimal.NewFromString(d.AskPr)
-	if err != nil || ask.IsZero() {
+	if err != nil || ask.IsZero() || bid.GreaterThan(ask) {
 		return domain.MarketTick{}, false
 	}
 
-	qVol, _ := decimal.NewFromString(d.QuoteVol)
+	qVol, err := decimal.NewFromString(d.QuoteVol)
+	if err != nil {
+		return domain.MarketTick{}, false
+	}
 	symbol := symbolReplacer.Replace(d.InstID)
 
 	return domain.MarketTick{
@@ -232,6 +245,8 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 		BestBid:     bid,
 		BestAsk:     ask,
 		QuoteVolume: qVol,
+		EventTime:   ts,
+		ReceivedAt:  ts,
 		Timestamp:   ts,
 	}, true
 }
@@ -254,6 +269,9 @@ func fetchSpotSymbols(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("bitget REST status %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -296,6 +314,9 @@ func fetchFuturesSymbols(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("bitget REST status %s", resp.Status)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -346,4 +367,96 @@ func keepAlive(ctx context.Context, conn *websocket.Conn) {
 func closeOnCtx(ctx context.Context, conn *websocket.Conn) {
 	<-ctx.Done()
 	conn.Close()
+}
+
+func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
+	go a.runCandleFeed(ctx, sink, domain.MarketTypeSpot)
+	go a.runCandleFeed(ctx, sink, domain.MarketTypeFutures)
+	<-ctx.Done()
+	return nil
+}
+
+type bitgetCandleResponse struct {
+	Action string `json:"action"`
+	Arg    struct {
+		InstType string `json:"instType"`
+		Channel  string `json:"channel"`
+		InstID   string `json:"instId"`
+	} `json:"arg"`
+	Data [][]string `json:"data"`
+	Ts   int64      `json:"ts"`
+}
+
+func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, market domain.MarketType) {
+	instType := "USDT-FUTURES"
+	if market == domain.MarketTypeSpot {
+		instType = "SPOT"
+	}
+	for ctx.Err() == nil {
+		symbols, err := fetchSymbols(ctx, instType)
+		if err != nil {
+			log.Printf("⚠️ Bitget %s candle symbols: %v", market, err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(reconnectDelay):
+			}
+			continue
+		}
+		if err := a.readCandleShard(ctx, sink, instType, symbols, market); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️ Bitget %s candle WS: %v", market, err)
+		}
+	}
+}
+
+func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, instType string, symbols []string, market domain.MarketType) error {
+	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+	go closeOnCtx(ctx, conn)
+	args := make([]argItem, 0, len(symbols))
+	for _, sym := range symbols {
+		args = append(args, argItem{InstType: instType, Channel: "candle1m", InstID: sym})
+	}
+	for i := 0; i < len(args); i += maxBatchSize {
+		end := i + maxBatchSize
+		if end > len(args) {
+			end = len(args)
+		}
+		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
+			return err
+		}
+	}
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		var r bitgetCandleResponse
+		if sonic.Unmarshal(msg, &r) != nil || len(r.Data) == 0 || r.Arg.InstID == "" {
+			continue
+		}
+		for _, d := range r.Data {
+			if len(d) < 8 {
+				continue
+			}
+			start, _ := strconv.ParseInt(d[0], 10, 64)
+			q := d[7]
+			if q == "" {
+				q = d[6]
+			}
+			vol, err := decimal.NewFromString(q)
+			if err != nil || !vol.IsPositive() {
+				continue
+			}
+			et := time.UnixMilli(r.Ts)
+			sink.UpdateCandle(domain.MarketCandle{Exchange: "BITGET", Symbol: r.Arg.InstID, MarketType: market, OpenTime: time.UnixMilli(start), CloseTime: time.UnixMilli(start + 59999), QuoteVolume: vol, EventTime: et, Closed: false})
+		}
+	}
 }
