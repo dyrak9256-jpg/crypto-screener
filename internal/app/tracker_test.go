@@ -59,7 +59,8 @@ func TestTracker_Lifecycle_OpenUpdatePeakClose(t *testing.T) {
 		Times(2)
 
 	router := NewNotificationRouter(userMgr, mockVolProvider, mockTgSender)
-	tracker := NewTracker(cfg, dbChan, router)
+	var routerWg sync.WaitGroup
+	tracker := NewTracker(cfg, dbChan, router, &routerWg)
 
 	t0 := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 	expectedKey := "BTCUSDT:CROSS_EXCHANGE:BINANCE:BYBIT"
@@ -166,6 +167,7 @@ func TestTracker_Lifecycle_OpenUpdatePeakClose(t *testing.T) {
 
 	// Wait for Telegram notification goroutines to complete
 	wg.Wait()
+	routerWg.Wait()
 }
 
 func TestTracker_ReEmergence(t *testing.T) {
@@ -173,7 +175,7 @@ func TestTracker_ReEmergence(t *testing.T) {
 
 	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.02"), decimal.RequireFromString("1000"))
 	dbChan := make(chan *domain.ArbitrageSignal, 10)
-	tracker := NewTracker(cfg, dbChan, nil)
+	tracker := NewTracker(cfg, dbChan, nil, nil)
 
 	t0 := time.Date(2026, 9, 5, 14, 0, 0, 0, time.UTC)
 	key := "ETHUSDT:CROSS_EXCHANGE:BINANCE:BYBIT"
@@ -241,7 +243,7 @@ func TestTracker_KeyNormalization(t *testing.T) {
 
 	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.02"), decimal.RequireFromString("1000"))
 	dbChan := make(chan *domain.ArbitrageSignal, 10)
-	tracker := NewTracker(cfg, dbChan, nil)
+	tracker := NewTracker(cfg, dbChan, nil, nil)
 
 	t0 := time.Now()
 
@@ -287,45 +289,37 @@ func TestTracker_DbChanFullDrop(t *testing.T) {
 	t.Parallel()
 
 	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.02"), decimal.RequireFromString("1000"))
-	// dbChan capacity 1, pre-filled
+	// dbChan capacity 1, pre-filled with an unrelated signal.
 	dbChan := make(chan *domain.ArbitrageSignal, 1)
 	dbChan <- &domain.ArbitrageSignal{ID: "PRE_EXISTING"}
 
-	tracker := NewTracker(cfg, dbChan, nil)
+	tracker := NewTracker(cfg, dbChan, nil, nil)
 	t0 := time.Now()
 
-	// Open signal
+	// Open signal.
 	tracker.HandleEvent(domain.SpreadEvent{
-		Symbol:     "ADAUSDT",
-		SpreadType: domain.CrossExchange,
-		Spread:     decimal.RequireFromString("0.03"),
-		ExchangeA:  "BINANCE",
-		ExchangeB:  "BYBIT",
-		Timestamp:  t0,
+		Symbol: "ADAUSDT", SpreadType: domain.CrossExchange,
+		Spread:    decimal.RequireFromString("0.03"),
+		ExchangeA: "BINANCE", ExchangeB: "BYBIT", Timestamp: t0,
 	})
 
-	// Close signal while dbChan is full -> hits default: branch without blocking
-	done := make(chan struct{})
-	go func() {
-		tracker.HandleEvent(domain.SpreadEvent{
-			Symbol:     "ADAUSDT",
-			SpreadType: domain.CrossExchange,
-			Spread:     decimal.RequireFromString("0.005"),
-			ExchangeA:  "BINANCE",
-			ExchangeB:  "BYBIT",
-			Timestamp:  t0.Add(10 * time.Second),
-		})
-		close(done)
-	}()
+	// Close the signal while dbChan is full. P7 contract: NO silent drop —
+	// the send must BLOCK until the reader drains, then deliver the signal.
+	go tracker.HandleEvent(domain.SpreadEvent{
+		Symbol: "ADAUSDT", SpreadType: domain.CrossExchange,
+		Spread:    decimal.RequireFromString("0.005"),
+		ExchangeA: "BINANCE", ExchangeB: "BYBIT", Timestamp: t0.Add(10 * time.Second),
+	})
+
+	// Reader drains both: first the pre-existing, then the closed signal.
+	first := <-dbChan
+	assert.Equal(t, "PRE_EXISTING", first.ID)
 
 	select {
-	case <-done:
-		// Succeeded without blocking
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("closing signal blocked on full dbChan")
+	case closed := <-dbChan:
+		assert.False(t, closed.IsActive)
+		assert.Equal(t, "ADAUSDT", closed.Symbol)
+	case <-time.After(2 * time.Second):
+		t.Fatal("closed signal must be delivered, not silently dropped")
 	}
-
-	assert.Len(t, dbChan, 1)
-	existing := <-dbChan
-	assert.Equal(t, "PRE_EXISTING", existing.ID)
 }

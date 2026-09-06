@@ -464,22 +464,21 @@ func TestShardedAggregator_VolumeTimeframes_And_EdgeCases(t *testing.T) {
 		assert.True(t, v.Equal(decimal.NewFromInt(500)), "expected volume 500 for timeframe %s, got %s", tf, v)
 	}
 
-	// 3. sendEventNonBlocking when trackerChan is full
+	// 3. sendEvent delivers without silent drop when a reader is present.
 	fullChan := make(chan domain.SpreadEvent, 1)
-	fullChan <- domain.SpreadEvent{Symbol: "DUMMY"}
 	saFull := NewShardedAggregator(fullChan, funding, cfg)
 
-	done := make(chan struct{})
+	delivered := make(chan domain.SpreadEvent, 1)
 	go func() {
-		saFull.sendEventNonBlocking(domain.SpreadEvent{Symbol: "DROPPED"})
-		close(done)
+		saFull.sendEvent(&domain.SpreadEvent{Symbol: "DELIVERED"})
+		delivered <- <-fullChan
 	}()
 
 	select {
-	case <-done:
-		// Succeeded without blocking
+	case got := <-delivered:
+		assert.Equal(t, "DELIVERED", got.Symbol)
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("sendEventNonBlocking blocked on full channel")
+		t.Fatal("sendEvent did not deliver event")
 	}
 
 	// 4. Intra-exchange with missing/zero prices

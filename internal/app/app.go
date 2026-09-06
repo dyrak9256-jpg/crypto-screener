@@ -36,10 +36,14 @@ type Application struct {
 	// Преимущество: нет блокировок при чтении — lock-free доступ
 	ctx atomic.Pointer[context.Context]
 
-	// Две независимые WaitGroup для детерминированного shutdown:
-	// workerWg  — ingestion + tracker воркеры
+	// Независимые WaitGroup для детерминированного shutdown:
+	// ingestWg  — приём тиков (останавливается первым; единственный продюсер trackerChan)
+	// trackerWg — трекер событий (единственный продюсер dbChan)
+	// routerWg  — горутины уведомлений (Broadcast)
 	// persistWg — PersistenceWorker (завершается последним)
-	workerWg  sync.WaitGroup
+	ingestWg  sync.WaitGroup
+	trackerWg sync.WaitGroup
+	routerWg  sync.WaitGroup
 	persistWg sync.WaitGroup
 }
 
@@ -55,13 +59,12 @@ func NewApplication(
 	fundingMgr := NewFundingManager(cfg)
 	aggregator := NewShardedAggregator(trackerChan, fundingMgr, cfg)
 	router := NewNotificationRouter(userMgr, aggregator, nil)
-	tracker := NewTracker(cfg, dbChan, router)
 	connMgr := NewConnectorManager(tickChan, fundingMgr)
 
-	return &Application{
+	a := &Application{
 		connManager: connMgr,
 		aggregator:  aggregator,
-		tracker:     tracker,
+
 		fundingMgr:  fundingMgr,
 		config:      cfg,
 		userMgr:     userMgr,
@@ -71,6 +74,8 @@ func NewApplication(
 		trackerChan: trackerChan,
 		dbChan:      dbChan,
 	}
+	a.tracker = NewTracker(cfg, dbChan, router, &a.routerWg)
+	return a
 }
 
 func (a *Application) SetTelegramSender(tg domain.TelegramSender) {
@@ -140,17 +145,16 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 		workerCount = 8
 	}
 	for i := 0; i < workerCount; i++ {
-		a.workerWg.Add(1)
+		a.ingestWg.Add(1)
 		go a.ingestionWorker(ctx)
 	}
 
-	// Tracker воркеры
-	for i := 0; i < 4; i++ {
-		a.workerWg.Add(1)
-		go a.trackerWorker(ctx)
-	}
+	// ОДИН tracker-воркер: гарантирует ПОСЛЕДОВАТЕЛЬНУЮ обработку событий
+	// одного ключа (требование строгого рефакторинга).
+	a.trackerWg.Add(1)
+	go a.trackerWorker()
 
-	log.Printf("✅ Engine started: %d ingestion workers, 4 tracker workers", workerCount)
+	log.Printf("✅ Engine started: %d ingestion workers, 1 tracker worker", workerCount)
 
 	<-ctx.Done()
 	log.Println("🛑 Graceful shutdown initiated...")
@@ -166,28 +170,38 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 	//                                           ──done──▶ return nil
 	// ═══════════════════════════════════════════════════════
 
-	// Шаг 1: Ждём завершения ingestion и tracker воркеров
-	a.workerWg.Wait()
-	log.Println("   ↳ [1/3] ingestion & tracker workers stopped")
+	// Шаг 1: Останавливаем приём тиков. После этого НЕТ продюсеров, пишущих в trackerChan.
+	a.ingestWg.Wait()
+	log.Println("   ↳ [1/5] ingestion workers stopped")
 
-	// Шаг 2: Закрываем dbChan — теперь безопасно
-	// После workerWg.Wait() гарантировано: никто больше не пишет в dbChan
+	// Шаг 2: Закрываем trackerChan — tracker-воркер дочитает и обработает ВСЕ события.
+	close(a.trackerChan)
+	a.trackerWg.Wait()
+	log.Println("   ↳ [2/5] tracker workers stopped (all signals emitted)")
+
+	// Шаг 3: Ждём горутины уведомлений (Telegram Broadcast).
+	a.routerWg.Wait()
+	log.Println("   ↳ [3/5] notification workers stopped")
+
+	// Шаг 4: Закрываем dbChan — теперь безопасно (никто больше не пишет).
 	close(a.dbChan)
-	log.Println("   ↳ [2/3] dbChan closed, draining persistence queue...")
+	log.Println("   ↳ [4/5] dbChan closed, draining persistence queue...")
 
-	// Шаг 3: Ждём PersistenceWorker — все сигналы записаны в БД
+	// Шаг 5: Ждём PersistenceWorker — все сигналы записаны в БД.
 	a.persistWg.Wait()
-	log.Println("   ↳ [3/3] persistence worker stopped")
+	log.Println("   ↳ [5/5] persistence worker stopped")
 
 	log.Println("✅ Shutdown complete. All signals persisted.")
 	return nil
 }
 
 func (a *Application) ingestionWorker(ctx context.Context) {
-	defer a.workerWg.Done()
+	defer a.ingestWg.Done()
 	for {
 		select {
 		case <-ctx.Done():
+			// Выходим; текущий in-flight тик уже обрабатывается (не прерываем его).
+			// Буфер tickChan содержит только сырые тики — они эфемерны.
 			return
 		case tick, ok := <-a.tickChan:
 			if !ok {
@@ -198,18 +212,14 @@ func (a *Application) ingestionWorker(ctx context.Context) {
 	}
 }
 
-func (a *Application) trackerWorker(ctx context.Context) {
-	defer a.workerWg.Done()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case event, ok := <-a.trackerChan:
-			if !ok {
-				return
-			}
-			a.tracker.HandleEvent(event)
-		}
+// trackerWorker читает trackerChan до его закрытия. Это гарантирует, что при
+// graceful shutdown Run() закрывает trackerChan ПОСЛЕ остановки всех продюсеров
+// (ingestWg.Wait()), поэтому воркер дообрабатывает все события и не выходит
+// преждевременно — сигналы не теряются.
+func (a *Application) trackerWorker() {
+	defer a.trackerWg.Done()
+	for event := range a.trackerChan {
+		a.tracker.HandleEvent(event)
 	}
 }
 
