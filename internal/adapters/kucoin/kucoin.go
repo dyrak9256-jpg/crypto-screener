@@ -2,37 +2,42 @@ package kucoin
 
 import (
 	"context"
-	"crypto-screener/internal/domain"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"time"
+
+	"crypto-screener/internal/domain"
 
 	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
 	"github.com/shopspring/decimal"
 )
 
-// KuCoin особенный: WS URL получается через REST API
 const (
-	bulletPublicURL = "https://api.kucoin.com/api/v1/bullet-public"
+	bulletSpotURL    = "https://api.kucoin.com/api/v1/bullet-public"
+	bulletFuturesURL = "https://api-futures.kucoin.com/api/v1/bullet-public"
 
-	handshakeTimeout = 10 * time.Second
-	pongWait         = 10 * time.Second
-	reconnectDelay   = 3 * time.Second
+	handshakeTimeout    = 10 * time.Second
+	pongWait            = 10 * time.Second
+	reconnectDelay      = 3 * time.Second
+	defaultPingInterval = 18 * time.Second // ✅ fallback если API вернул 0
 )
 
-var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+var (
+	dialer     = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+	httpClient = &http.Client{Timeout: 10 * time.Second}
+)
 
-// REST ответ для получения WS endpoint
 type bulletResponse struct {
 	Data struct {
 		Token           string `json:"token"`
 		InstanceServers []struct {
 			Endpoint     string `json:"endpoint"`
 			PingInterval int    `json:"pingInterval"` // миллисекунды
-			PingTimeout  int    `json:"pingTimeout"`
 		} `json:"instanceServers"`
 	} `json:"data"`
 }
@@ -52,14 +57,20 @@ type wsMessage struct {
 	Data    tickerData `json:"data"`
 }
 
+// tickerData покрывает оба формата
+// Spot:    BestBid / BestAsk
+// Futures: BestBidPrice / BestAskPrice
 type tickerData struct {
-	Symbol  string `json:"symbol"` // "BTC-USDT"
-	BestBid string `json:"bestBid"`
-	BestAsk string `json:"bestAsk"`
-	// KuCoin не даёт volume в ticker топике — используем 0
+	Symbol       string `json:"symbol"`
+	BestBid      string `json:"bestBid"`
+	BestAsk      string `json:"bestAsk"`
+	BestBidPrice string `json:"bestBidPrice"`
+	BestAskPrice string `json:"bestAskPrice"`
 }
 
-type Adapter struct{}
+type Adapter struct {
+	droppedTicks atomic.Uint64
+}
 
 func NewAdapter() *Adapter { return &Adapter{} }
 
@@ -68,23 +79,32 @@ func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick)
 	return nil
 }
 
-// KuCoin Futures использует отдельный API
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listenFutures(ctx, out)
+	go a.listen(ctx, domain.MarketTypeFutures, out)
 	return nil
 }
 
 func (a *Adapter) listen(ctx context.Context, mType domain.MarketType, out chan<- domain.MarketTick) {
+	bulletURL := bulletSpotURL
+	topic := "/market/ticker:all"
+
+	if mType == domain.MarketTypeFutures {
+		bulletURL = bulletFuturesURL
+		topic = "/contractMarket/ticker:all"
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := a.connectAndRead(ctx, mType, out); err != nil {
+
+		if err := a.connectAndRead(ctx, bulletURL, topic, mType, out); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			log.Printf("⚠️  KuCoin %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
 		}
+
 		select {
 		case <-ctx.Done():
 			return
@@ -93,65 +113,20 @@ func (a *Adapter) listen(ctx context.Context, mType domain.MarketType, out chan<
 	}
 }
 
-func (a *Adapter) listenFutures(ctx context.Context, out chan<- domain.MarketTick) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectFutures(ctx, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  KuCoin Futures WS: %v — reconnecting in %s", err, reconnectDelay)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
-}
-
-// getWSEndpoint получает временный WS URL через REST
-func getWSEndpoint(ctx context.Context, restURL string) (endpoint, token string, pingMs int, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, restURL, nil)
-	if err != nil {
-		return "", "", 0, err
-	}
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", "", 0, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", 0, err
-	}
-
-	var bullet bulletResponse
-	if err := sonic.Unmarshal(body, &bullet); err != nil {
-		return "", "", 0, err
-	}
-
-	if len(bullet.Data.InstanceServers) == 0 {
-		return "", "", 0, fmt.Errorf("no instance servers returned")
-	}
-
-	srv := bullet.Data.InstanceServers[0]
-	return srv.Endpoint, bullet.Data.Token, srv.PingInterval, nil
-}
-
-func (a *Adapter) connectAndRead(ctx context.Context, mType domain.MarketType, out chan<- domain.MarketTick) error {
-	endpoint, token, pingMs, err := getWSEndpoint(ctx, bulletPublicURL)
+func (a *Adapter) connectAndRead(
+	ctx context.Context,
+	bulletURL string,
+	topic string,
+	mType domain.MarketType,
+	out chan<- domain.MarketTick,
+) error {
+	endpoint, token, pingInterval, err := getWSEndpoint(ctx, bulletURL)
 	if err != nil {
 		return fmt.Errorf("get ws endpoint: %w", err)
 	}
 
-	// URL: endpoint?token=xxx&connectId=yyy
-	wsURL := fmt.Sprintf("%s?token=%s&connectId=spot-%d", endpoint, token, time.Now().UnixNano())
-	pingInterval := time.Duration(pingMs) * time.Millisecond
+	wsURL := fmt.Sprintf("%s?token=%s&connectId=%s-%d",
+		endpoint, token, mType, time.Now().UnixNano())
 
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
@@ -159,13 +134,12 @@ func (a *Adapter) connectAndRead(ctx context.Context, mType domain.MarketType, o
 	}
 	defer conn.Close()
 
-	log.Printf("✅ KuCoin Spot connected")
+	log.Printf("✅ KuCoin %s connected (ping every %s)", mType, pingInterval)
 
-	// Подписка на все тикеры
 	sub := subscribeMsg{
 		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
 		Type:     "subscribe",
-		Topic:    "/market/ticker:all",
+		Topic:    topic,
 		Response: true,
 	}
 	if err := conn.WriteJSON(sub); err != nil {
@@ -176,7 +150,11 @@ func (a *Adapter) connectAndRead(ctx context.Context, mType domain.MarketType, o
 	defer cancel()
 
 	go closeOnCtx(connCtx, conn)
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+
+	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+
 	go kucoinKeepAlive(connCtx, conn, pingInterval)
 
 	for {
@@ -208,90 +186,40 @@ func (a *Adapter) connectAndRead(ctx context.Context, mType domain.MarketType, o
 		case <-connCtx.Done():
 			return nil
 		default:
-		}
-	}
-}
-
-func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	// KuCoin Futures отдельный bullet endpoint
-	endpoint, token, pingMs, err := getWSEndpoint(ctx, "https://api-futures.kucoin.com/api/v1/bullet-public")
-	if err != nil {
-		return fmt.Errorf("get futures ws endpoint: %w", err)
-	}
-
-	wsURL := fmt.Sprintf("%s?token=%s&connectId=futures-%d", endpoint, token, time.Now().UnixNano())
-	pingInterval := time.Duration(pingMs) * time.Millisecond
-
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		return fmt.Errorf("dial futures: %w", err)
-	}
-	defer conn.Close()
-
-	log.Printf("✅ KuCoin Futures connected")
-
-	sub := subscribeMsg{
-		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
-		Type:     "subscribe",
-		Topic:    "/contractMarket/ticker:all",
-		Response: true,
-	}
-	if err := conn.WriteJSON(sub); err != nil {
-		return fmt.Errorf("subscribe futures: %w", err)
-	}
-
-	connCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go closeOnCtx(connCtx, conn)
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
-	go kucoinKeepAlive(connCtx, conn, pingInterval)
-
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
+			if n := a.droppedTicks.Add(1); n%1000 == 0 {
+				log.Printf("⚠️  KuCoin %s: dropped %d ticks (channel full)", mType, n)
 			}
-			return fmt.Errorf("read futures: %w", err)
-		}
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
-
-		var wsMsg wsMessage
-		if err := sonic.Unmarshal(msg, &wsMsg); err != nil {
-			continue
-		}
-
-		if wsMsg.Type != "message" {
-			continue
-		}
-
-		tick, ok := toMarketTick(&wsMsg.Data, domain.MarketTypeFutures)
-		if !ok {
-			continue
-		}
-
-		select {
-		case out <- tick:
-		case <-connCtx.Done():
-			return nil
-		default:
 		}
 	}
 }
 
 func toMarketTick(d *tickerData, mType domain.MarketType) (domain.MarketTick, bool) {
-	bid, err := decimal.NewFromString(d.BestBid)
+	bidStr := d.BestBid
+	askStr := d.BestAsk
+
+	if mType == domain.MarketTypeFutures {
+		if bidStr == "" || bidStr == "0" {
+			bidStr = d.BestBidPrice
+		}
+		if askStr == "" || askStr == "0" {
+			askStr = d.BestAskPrice
+		}
+	}
+
+	bid, err := decimal.NewFromString(bidStr)
 	if err != nil || bid.IsZero() {
 		return domain.MarketTick{}, false
 	}
-	ask, err := decimal.NewFromString(d.BestAsk)
+
+	ask, err := decimal.NewFromString(askStr)
 	if err != nil || ask.IsZero() {
 		return domain.MarketTick{}, false
 	}
 
-	// "BTC-USDT" → "BTCUSDT"
-	symbol := normalizeSymbol(d.Symbol)
+	symbol, ok := normalizeSymbol(d.Symbol, mType)
+	if !ok {
+		return domain.MarketTick{}, false
+	}
 
 	return domain.MarketTick{
 		Exchange:    "KUCOIN",
@@ -299,22 +227,81 @@ func toMarketTick(d *tickerData, mType domain.MarketType) (domain.MarketTick, bo
 		MarketType:  mType,
 		BestBid:     bid,
 		BestAsk:     ask,
-		QuoteVolume: decimal.Zero, // KuCoin ticker не даёт volume
+		QuoteVolume: decimal.Zero,
 		Timestamp:   time.Now(),
 	}, true
 }
 
-func normalizeSymbol(s string) string {
-	result := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		if s[i] != '-' {
-			result = append(result, s[i])
-		}
+// normalizeSymbol приводит символ к формату BTCUSDT
+//
+// Spot:    "BTC-USDT"  → "BTCUSDT"
+// Futures: "XBTUSDTM"  → "BTCUSDT"  (perpetual, XBT→BTC)
+//
+//	"ETHUSDTM"  → "ETHUSDT"  (perpetual)
+//	"XBTMM24"   → ("", false) (квартальный — пропускаем)
+func normalizeSymbol(s string, mType domain.MarketType) (string, bool) {
+	if mType == domain.MarketTypeSpot {
+		return strings.ReplaceAll(s, "-", ""), true
 	}
-	return string(result)
+
+	// Futures: только perpetual контракты
+	// Признак perpetual: суффикс USDTM или USDM
+	if !strings.HasSuffix(s, "USDTM") && !strings.HasSuffix(s, "USDM") {
+		return "", false
+	}
+
+	// Убираем суффикс M: XBTUSDTM → XBTUSDT
+	s = strings.TrimSuffix(s, "M")
+
+	// XBT → BTC: KuCoin использует старое обозначение Bitcoin
+	// "BTC" + s[3:] — компилятор эффективно оптимизирует короткую конкатенацию
+	if strings.HasPrefix(s, "XBT") {
+		return "BTC" + s[3:], true
+	}
+
+	return s, true
 }
 
-// KuCoin ping: JSON {"id":"...","type":"ping"}
+// getWSEndpoint получает временный WS URL и pingInterval через REST
+func getWSEndpoint(ctx context.Context, restURL string) (endpoint, token string, pingInterval time.Duration, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, restURL, nil)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	var bullet bulletResponse
+	if err := sonic.Unmarshal(body, &bullet); err != nil {
+		return "", "", 0, fmt.Errorf("parse bullet: %w", err)
+	}
+
+	if len(bullet.Data.InstanceServers) == 0 {
+		return "", "", 0, fmt.Errorf("no instance servers in response")
+	}
+
+	srv := bullet.Data.InstanceServers[0]
+
+	// ✅ Защита от паники: time.NewTicker(0) → panic
+	pingMs := srv.PingInterval
+	if pingMs <= 0 {
+		log.Printf("⚠️  KuCoin returned invalid pingInterval=%d, using default %s",
+			pingMs, defaultPingInterval)
+		return srv.Endpoint, bullet.Data.Token, defaultPingInterval, nil
+	}
+
+	return srv.Endpoint, bullet.Data.Token, time.Duration(pingMs) * time.Millisecond, nil
+}
+
 func kucoinKeepAlive(ctx context.Context, conn *websocket.Conn, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
