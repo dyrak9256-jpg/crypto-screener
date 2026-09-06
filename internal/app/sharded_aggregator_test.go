@@ -63,9 +63,11 @@ func TestShardedAggregator_ShardRouting(t *testing.T) {
 			require.NotNil(t, targetShard.prices[symbol]["BYBIT"], "target shard must have BYBIT prices")
 
 			// Check Spot mid price: (100 + 102) / 2 = 101
-			assert.True(t, targetShard.prices[symbol]["BINANCE"].Spot.Equal(decimal.RequireFromString("101")))
+			assert.True(t, targetShard.prices[symbol]["BINANCE"].SpotBid.Equal(decimal.RequireFromString("100")))
+			assert.True(t, targetShard.prices[symbol]["BINANCE"].SpotAsk.Equal(decimal.RequireFromString("102")))
 			// Check Futures mid price: (103 + 105) / 2 = 104
-			assert.True(t, targetShard.prices[symbol]["BYBIT"].Futures.Equal(decimal.RequireFromString("104")))
+			assert.True(t, targetShard.prices[symbol]["BYBIT"].FuturesBid.Equal(decimal.RequireFromString("103")))
+			assert.True(t, targetShard.prices[symbol]["BYBIT"].FuturesAsk.Equal(decimal.RequireFromString("105")))
 			targetShard.mu.Unlock()
 
 			// Check all OTHER shards to ensure no state leakage
@@ -143,8 +145,8 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 		assert.Equal(t, "KRAKEN", finalEvent.ExchangeA, "ExchangeA should be minimum exchange")
 		assert.Equal(t, "OKX", finalEvent.ExchangeB, "ExchangeB should be maximum exchange")
 
-		// Spread = (105 - 98) / 98
-		expectedSpread := decimal.RequireFromString("105").Sub(decimal.RequireFromString("98")).Div(decimal.RequireFromString("98"))
+		// Spread = (maxBid - minAsk) / minAsk = (104.9 - 98.1) / 98.1
+		expectedSpread := decimal.RequireFromString("104.9").Sub(decimal.RequireFromString("98.1")).Div(decimal.RequireFromString("98.1"))
 		assert.True(t, finalEvent.Spread.Equal(expectedSpread), "expected spread %s, got %s", expectedSpread, finalEvent.Spread)
 	})
 
@@ -214,7 +216,7 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 		now := time.Now()
 		symbol := "DOGEUSDT"
 
-		// Spot mid = 0.10
+		// Spot bid/ask = 0.10
 		sa.ProcessTick(domain.MarketTick{
 			Exchange:    "BINANCE",
 			Symbol:      symbol,
@@ -225,7 +227,7 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 			Timestamp:   now,
 		})
 
-		// Futures mid = 0.105 -> Intra spread = |0.105 - 0.10| / 0.10 = 0.05 (5%)
+		// Futures bid/ask = 0.105 -> executable intra spread = (0.105 - 0.10)/0.10 = 0.05 (5%)
 		sa.ProcessTick(domain.MarketTick{
 			Exchange:    "BINANCE",
 			Symbol:      symbol,
@@ -296,6 +298,7 @@ func TestShardedAggregator_VolumeBucketing(t *testing.T) {
 	funding := NewFundingManager(cfg)
 	trackerChan := make(chan domain.SpreadEvent, 100)
 	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	sa.staleWindow = 7 * 24 * time.Hour // historical fixtures are not "stale" here
 
 	t0 := time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC)
 	symbol := "BTCUSDT"
@@ -429,6 +432,7 @@ func TestShardedAggregator_VolumeTimeframes_And_EdgeCases(t *testing.T) {
 	funding := NewFundingManager(cfg)
 	trackerChan := make(chan domain.SpreadEvent, 100)
 	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	sa.staleWindow = 7 * 24 * time.Hour // historical fixtures are not "stale" here
 
 	t0 := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 
