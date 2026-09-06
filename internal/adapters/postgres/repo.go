@@ -40,17 +40,18 @@ func (r *Repository) Close() {
 
 func (r *Repository) SaveSignal(ctx context.Context, s *domain.ArbitrageSignal) error {
 	const query = `
-		INSERT INTO signals (
-			id, symbol, spread_type, exchange_a, exchange_b,
-			opened_at, closed_at, is_active,
-			initial_spread, peak_spread, final_spread, duration_ms
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-		ON CONFLICT (id) DO UPDATE SET
-			closed_at     = EXCLUDED.closed_at,
-			is_active     = EXCLUDED.is_active,
-			peak_spread   = EXCLUDED.peak_spread,
-			final_spread  = EXCLUDED.final_spread,
-			duration_ms   = EXCLUDED.duration_ms`
+			INSERT INTO signals (
+				id, symbol, spread_type, exchange_a, exchange_b,
+				opened_at, closed_at, is_active,
+				initial_spread, peak_spread, final_spread, duration_ms, quote_volume
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			ON CONFLICT (id) DO UPDATE SET
+				closed_at     = EXCLUDED.closed_at,
+				is_active     = EXCLUDED.is_active,
+				peak_spread   = EXCLUDED.peak_spread,
+				final_spread  = EXCLUDED.final_spread,
+				duration_ms   = EXCLUDED.duration_ms,
+				quote_volume  = EXCLUDED.quote_volume`
 
 	// ✅ Используем *time.Time вместо sql.NullTime
 	// pgx/v5 нативно понимает указатели как NULL
@@ -73,6 +74,7 @@ func (r *Repository) SaveSignal(ctx context.Context, s *domain.ArbitrageSignal) 
 		s.PeakSpread.String(),
 		s.FinalSpread.String(),
 		s.Duration.Milliseconds(),
+		s.QuoteVolume.String(),
 	)
 	if err != nil {
 		return fmt.Errorf("save signal %s: %w", s.ID, err)
@@ -146,29 +148,8 @@ func (r *Repository) GetAllUsers(ctx context.Context) ([]*domain.User, error) {
 	return users, nil
 }
 
-func (r *Repository) GetUserByChatID(ctx context.Context, chatID int64) (*domain.User, error) {
-	const query = `
-		SELECT chat_id, username, min_spread, min_volume, timeframe
-		FROM users WHERE chat_id = $1`
-
-	rows, err := r.pool.Query(ctx, query, chatID)
-	if err != nil {
-		return nil, fmt.Errorf("query user %d: %w", chatID, err)
-	}
-	defer rows.Close()
-
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("query user %d: %w", chatID, err)
-		}
-		return nil, nil // пользователь не найден
-	}
-
-	return scanUser(rows)
-}
-
 // scanUser читает одну строку и возвращает User
-// Выделено отдельно чтобы не дублировать логику в GetAllUsers и GetUserByChatID
+// Выделено отдельно чтобы не дублировать логику в GetAllUsers (и других методах users)
 func scanUser(rows interface {
 	Scan(dest ...any) error
 }) (*domain.User, error) {

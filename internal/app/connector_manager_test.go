@@ -23,8 +23,7 @@ func TestConnectorManager_AddAndRemove(t *testing.T) {
 	tickChan := make(chan domain.MarketTick, 10)
 	mockFundingSink := mocks.NewMockFundingSink(ctrl)
 	cm := NewConnectorManager(tickChan, mockFundingSink)
-
-	mockConn := mocks.NewMockExchangeConnector(ctrl)
+	parentCtx := context.Background()
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -32,64 +31,89 @@ func TestConnectorManager_AddAndRemove(t *testing.T) {
 	var capturedCtx context.Context
 	var mu sync.Mutex
 
-	mockConn.EXPECT().
+	// Первый коннектор: блокируется до отмены своего контекста.
+	conn1 := mocks.NewMockExchangeConnector(ctrl)
+	conn1.EXPECT().
 		ConnectSpot(gomock.Any(), tickChan).
-		Do(func(ctx context.Context, ch chan<- domain.MarketTick) {
+		DoAndReturn(func(ctx context.Context, _ chan<- domain.MarketTick) error {
 			mu.Lock()
 			capturedCtx = ctx
 			mu.Unlock()
 			wg.Done()
 			<-ctx.Done()
+			return nil
 		}).
-		Times(1)
-
-	mockConn.EXPECT().
+		AnyTimes()
+	conn1.EXPECT().
 		ConnectFutures(gomock.Any(), tickChan).
-		Do(func(ctx context.Context, ch chan<- domain.MarketTick) {
+		DoAndReturn(func(ctx context.Context, _ chan<- domain.MarketTick) error {
 			wg.Done()
 			<-ctx.Done()
+			return nil
 		}).
-		Times(1)
-
-	mockConn.EXPECT().
+		AnyTimes()
+	conn1.EXPECT().
 		ConnectFunding(gomock.Any(), mockFundingSink).
-		Do(func(ctx context.Context, sink domain.FundingSink) {
+		DoAndReturn(func(ctx context.Context, _ domain.FundingSink) error {
 			wg.Done()
 			<-ctx.Done()
+			return nil
 		}).
-		Times(1)
-
-	parentCtx := context.Background()
+		AnyTimes()
 
 	// 1. AddConnector
-	err := cm.AddConnector("BINANCE", mockConn, parentCtx)
-	require.NoError(t, err)
-
-	wg.Wait() // Wait for all 3 goroutines to launch
+	require.NoError(t, cm.AddConnector("BINANCE", conn1, parentCtx))
+	wg.Wait() // Дождались запуска 3 потоков (Spot/Futures/Funding)
 
 	cm.mu.Lock()
-	assert.Contains(t, cm.connectors, "BINANCE")
+	_, ok := cm.entries["BINANCE"]
 	cm.mu.Unlock()
+	require.True(t, ok, "connector should be registered")
 
-	// 2. Duplicate AddConnector should be a no-op (no extra calls)
-	err = cm.AddConnector("BINANCE", mockConn, parentCtx)
-	require.NoError(t, err)
+	// 2. Hot-Swap: повторный AddConnector с тем же именем заменяет старый entry.
+	//   Старый коннектор должен быть остановлен, остаётся ровно один entry.
+	var wg2 sync.WaitGroup
+	wg2.Add(3)
+	conn2 := mocks.NewMockExchangeConnector(ctrl)
+	conn2.EXPECT().
+		ConnectSpot(gomock.Any(), tickChan).
+		DoAndReturn(func(ctx context.Context, _ chan<- domain.MarketTick) error { wg2.Done(); <-ctx.Done(); return nil }).
+		AnyTimes()
+	conn2.EXPECT().
+		ConnectFutures(gomock.Any(), tickChan).
+		DoAndReturn(func(ctx context.Context, _ chan<- domain.MarketTick) error { wg2.Done(); <-ctx.Done(); return nil }).
+		AnyTimes()
+	conn2.EXPECT().
+		ConnectFunding(gomock.Any(), mockFundingSink).
+		DoAndReturn(func(ctx context.Context, _ domain.FundingSink) error { wg2.Done(); <-ctx.Done(); return nil }).
+		AnyTimes()
 
-	// 3. RemoveConnector
-	cm.RemoveConnector("BINANCE")
+	require.NoError(t, cm.AddConnector("BINANCE", conn2, parentCtx))
+	wg2.Wait()
 
-	cm.mu.Lock()
-	assert.NotContains(t, cm.connectors, "BINANCE")
-	cm.mu.Unlock()
-
-	// Verify child context was cancelled
+	// Контекст старого коннектора должен быть отменён при hot-swap.
+	mu.Lock()
+	ctx1 := capturedCtx
+	mu.Unlock()
 	select {
-	case <-capturedCtx.Done():
-		// Success! Context was cancelled by RemoveConnector
-	case <-time.After(1 * time.Second):
-		t.Fatal("child context should have been cancelled by RemoveConnector")
+	case <-ctx1.Done():
+		// Отлично: hot-swap отменил контекст старого коннектора.
+	case <-time.After(2 * time.Second):
+		t.Fatal("old connector context should have been cancelled by hot-swap")
 	}
 
-	// 4. Removing non-existent connector is safe
-	cm.RemoveConnector("NON_EXISTENT")
+	cm.mu.Lock()
+	_, ok = cm.entries["BINANCE"]
+	cm.mu.Unlock()
+	require.True(t, ok, "new connector should be registered after hot-swap")
+
+	// 3. RemoveConnector
+	require.NoError(t, cm.RemoveConnector("BINANCE"))
+	cm.mu.Lock()
+	_, ok = cm.entries["BINANCE"]
+	cm.mu.Unlock()
+	assert.False(t, ok, "connector should be removed")
+
+	// 4. Removing non-existent connector returns error
+	require.Error(t, cm.RemoveConnector("NON_EXISTENT"))
 }

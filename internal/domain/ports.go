@@ -1,5 +1,7 @@
 package domain
 
+//go:generate mockgen -destination mocks/mock_ports.go -package mocks crypto-screener/internal/domain ExchangeConnector,FundingSink,TelegramSender,SignalRepository,UserRepository,CommandHandler,VolumeProvider
+
 import (
 	"context"
 	"time"
@@ -14,7 +16,9 @@ type ExchangeConnector interface {
 }
 
 type FundingSink interface {
-	UpdateFunding(symbol string, rate decimal.Decimal, nextTime time.Time)
+	// UpdateFunding регистрирует ставку финансирования для конкретной биржи.
+	// exchange — идентификатор биржи-источника; ставки хранятся отдельно на биржу.
+	UpdateFunding(exchange string, symbol string, rate decimal.Decimal, nextTime time.Time)
 }
 
 type TelegramSender interface {

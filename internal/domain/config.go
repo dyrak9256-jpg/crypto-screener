@@ -18,17 +18,15 @@ const (
 	TF_24h Timeframe = "24h"
 )
 
+// ScreenerConfig — потокобезопасная конфигурация жёстких порогов и политик.
+// Персональные настройки пользователей (мин. спред/объём/таймфрейм) живут в User
+// и применяются в NotificationRouter; здесь — только глобальные guardrails.
 type ScreenerConfig struct {
 	mu sync.RWMutex
 
 	hardMinSpread     decimal.Decimal
 	hardMinVolume     decimal.Decimal
 	fundingTimeBuffer int // Буфер в минутах до выплаты funding
-
-	userCrossSpread decimal.Decimal
-	userIntraSpread decimal.Decimal
-	userMinVolume   decimal.Decimal
-	userTimeframe   Timeframe
 }
 
 func NewScreenerConfig(hardSpread, hardVol decimal.Decimal) *ScreenerConfig {
@@ -36,38 +34,10 @@ func NewScreenerConfig(hardSpread, hardVol decimal.Decimal) *ScreenerConfig {
 		hardMinSpread:     hardSpread,
 		hardMinVolume:     hardVol,
 		fundingTimeBuffer: 30, // По умолчанию игнорируем сигналы за 30 минут до funding
-		userCrossSpread:   hardSpread,
-		userIntraSpread:   hardSpread,
-		userMinVolume:     hardVol,
-		userTimeframe:     TF_15m,
 	}
 }
 
 // --- Getters ---
-
-func (c *ScreenerConfig) GetEffectiveCrossSpread() decimal.Decimal {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.userCrossSpread
-}
-
-func (c *ScreenerConfig) GetEffectiveIntraSpread() decimal.Decimal {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.userIntraSpread
-}
-
-func (c *ScreenerConfig) GetEffectiveMinVolume() decimal.Decimal {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.userMinVolume
-}
-
-func (c *ScreenerConfig) GetUserTimeframe() Timeframe {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.userTimeframe
-}
 
 func (c *ScreenerConfig) GetHardMinSpread() decimal.Decimal {
 	c.mu.RLock()
@@ -87,10 +57,13 @@ func (c *ScreenerConfig) GetFundingTimeBuffer() int {
 	return c.fundingTimeBuffer
 }
 
+// GetCloseThreshold возвращает порог, при котором активный сигнал считается
+// закрывшимся. Используется явный гистерезис: половина жёсткого минимального
+// спреда с абсолютным полом 0.1%, чтобы избежать «дребезга» на границе порогов.
 func (c *ScreenerConfig) GetCloseThreshold() decimal.Decimal {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	close := c.userCrossSpread.Div(decimal.NewFromInt(2))
+	close := c.hardMinSpread.Div(decimal.NewFromInt(2))
 	minClose := decimal.NewFromFloat(0.001) // 0.1% absolute minimum
 	if close.LessThan(minClose) {
 		return minClose
@@ -98,6 +71,8 @@ func (c *ScreenerConfig) GetCloseThreshold() decimal.Decimal {
 	return close
 }
 
+// IsPairEnabled — признак того, что пара допущена к анализу.
+// Сейчас фильтр пар отключён (все пары включены); можно расширить allow-list'ом.
 func (c *ScreenerConfig) IsPairEnabled(symbol string) bool {
 	return true
 }

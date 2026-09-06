@@ -48,18 +48,22 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 			default:
 			}
 
-			// Уведомляем роутер о закрытии
+			// Уведомляем роутер о закрытии.
+			// Передаём СНАПШОТ (копию по значению): обработка в отдельной горутине
+			// не должна гоняться с мутацией PeakSpread/FinalSpread в HandleEvent.
 			if t.router != nil {
-				go t.router.ProcessSignal(signal, false)
+				snapshot := *signal
+				go t.router.ProcessSignal(&snapshot, false)
 			}
 		}
 	} else {
 		newSignal := domain.NewArbitrageSignal(event, event.Timestamp)
 		t.activeSignals[key] = newSignal
 
-		// Уведомляем роутер об открытии
+		// Уведомляем роутер об открытии (тоже передаём копию-снапшот).
 		if t.router != nil {
-			go t.router.ProcessSignal(newSignal, true)
+			snapshot := *newSignal
+			go t.router.ProcessSignal(&snapshot, true)
 		}
 	}
 }

@@ -9,7 +9,7 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"crypto-screener/internal/adapters/binance"
+	"crypto-screener/internal/adapters"
 	"crypto-screener/internal/adapters/postgres"
 	"crypto-screener/internal/adapters/telegram"
 	"crypto-screener/internal/app"
@@ -46,7 +46,7 @@ func main() {
 	screenerCfg := domain.NewScreenerConfig(cfg.HardMinSpread, cfg.HardMinVolume)
 
 	// Передаем userRepo в Application
-	application := app.NewApplication(screenerCfg, dbRepo, dbRepo)
+	application := app.NewApplication(screenerCfg, dbRepo)
 
 	// Создаем бота БЕЗ фиксированного chatID
 	tgBot, err := telegram.NewBot(cfg.TelegramToken, application)
@@ -59,10 +59,20 @@ func main() {
 
 	go tgBot.StartPolling(ctx)
 
-	binanceAdapter := binance.NewAdapter()
-	application.GetConnectorManager().AddConnector("BINANCE", binanceAdapter, ctx)
+	// Подключаем ВСЕ зарегистрированные биржевые коннекторы
+	// (Spot / Futures / Funding каждый в отдельной горутине с авто-реконнектом).
+	cm := application.GetConnectorManager()
+	for _, ex := range adapters.Supported() {
+		if err := cm.AddConnector(ex.Name, ex.New(), ctx); err != nil {
+			log.Printf("⚠️  failed to connect %s: %v", ex.Name, err)
+		}
+	}
 
 	if err := application.Run(ctx, dbRepo); err != nil {
 		log.Fatalf("App failed: %v", err)
 	}
+
+	// Детерминированное завершение: останавливаем биржевые коннекторы.
+	cm.StopAll()
+	log.Println("✅ Engine stopped cleanly.")
 }

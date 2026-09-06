@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"crypto-screener/internal/domain"
@@ -49,6 +50,13 @@ func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOp
 	}
 
 	if len(targets) == 0 {
+		return
+	}
+
+	// Telegram-отправитель может быть не инжектирован (например, в тестах или
+	// до вызова SetTelegramSender) — защищаемся от nil-паники.
+	if nr.telegram == nil {
+		log.Println("⚠️  NotificationRouter: telegram sender is nil, skipping broadcast")
 		return
 	}
 
