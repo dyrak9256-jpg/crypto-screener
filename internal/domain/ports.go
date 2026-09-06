@@ -1,5 +1,7 @@
 package domain
 
+//go:generate mockgen -destination mocks/mock_ports.go -package mocks crypto-screener/internal/domain ExchangeConnector,FundingSink,TelegramSender,SignalRepository,UserRepository,CommandHandler,VolumeProvider
+
 import (
 	"context"
 	"time"

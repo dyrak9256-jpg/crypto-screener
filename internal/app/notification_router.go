@@ -80,6 +80,13 @@ func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOp
 		return nil
 	}
 
+	// Telegram-отправитель может быть не инжектирован (например, в тестах или
+	// до вызова SetTelegramSender) — защищаемся от nil-паники.
+	if nr.telegram == nil {
+		log.Println("⚠️  NotificationRouter: telegram sender is nil, skipping broadcast")
+		return
+	}
+
 	var text string
 	if isOpened {
 		text = fmt.Sprintf("🚨 SIGNAL OPENED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nSpread: %s%%\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.InitialSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), signal.OpenedAt.Format(time.RFC3339Nano))

@@ -8,12 +8,17 @@ import (
 	"crypto-screener/internal/domain"
 )
 
+// Tracker ведёт активные сигналы и гарантирует последовательную обработку
+// событий одного ключа. Отправка в персистентность выполняется БЛОКИРУЮЩЕ и
+// ВНЕ мьютекса (никакой тихой потери сигналов). Уведомления — отслеживаемые
+// горутины (routerWg), чтобы graceful shutdown дождался их завершения.
 type Tracker struct {
 	mu            sync.Mutex
 	activeSignals map[string]*domain.ArbitrageSignal
 	config        *domain.ScreenerConfig
 	dbChan        chan<- *domain.ArbitrageSignal
 	router        *NotificationRouter
+	routerWg      *sync.WaitGroup
 }
 
 func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSignal, router *NotificationRouter) *Tracker {

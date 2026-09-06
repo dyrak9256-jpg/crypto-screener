@@ -5,7 +5,6 @@ import (
 
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestScreenerConfig_SetUserCrossSpread_EnforcesHardLimit(t *testing.T) {
@@ -74,7 +73,6 @@ func TestScreenerConfig_SetUserCrossSpread_EnforcesHardLimit(t *testing.T) {
 func TestScreenerConfig_GetCloseThreshold(t *testing.T) {
 	t.Parallel()
 
-	hardLimit := decimal.RequireFromString("0.01")
 	hardVol := decimal.RequireFromString("1000000")
 
 	t.Run("calculates half of hard spread", func(t *testing.T) {

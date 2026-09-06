@@ -15,6 +15,18 @@ const (
 	defaultPriceTTL = 5 * time.Second
 )
 
+// staleWindow — максимально допустимый возраст тика. Данные старше считаются
+// устаревшими и исключаются из расчёта (нельзя арбитражить по устаревшей цене).
+const staleWindow = 15 * time.Second
+
+// intervalVolumeTF — таймфрейм, по которому считается "интервальный" объём,
+// попадающий в SpreadEvent.QuoteVolume. Это НЕ 24h-rolling с биржи: объём
+// выводcтся из накопленных минутных дельт (см. getSymbolVolumeInternal).
+const intervalVolumeTF = domain.TF_5m
+
+// PriceState хранит ЛУЧШИЕ цены спроса/предложения отдельно для спота и фьючерсов.
+// Mid-price больше НЕ используется для исполняемого спреда: спред считается по
+// bid/ask-маршруту (купля по ask, продажа по bid).
 type PriceState struct {
 	Bid, Ask       decimal.Decimal
 	ReceivedAt     time.Time
@@ -64,6 +76,7 @@ func NewShardedAggregator(trackerChan chan<- domain.SpreadEvent, funding *Fundin
 			active: make(map[string]*routeState),
 		}
 	}
+	sa.staleWindow = staleWindow
 	return sa
 }
 

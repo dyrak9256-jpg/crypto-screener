@@ -190,30 +190,6 @@ func (a *Adapter) readBinanceCandleShard(ctx context.Context, sink domain.Candle
 
 // --- Ticker ---
 
-func (a *Adapter) listen(
-	ctx context.Context,
-	url string,
-	mType domain.MarketType,
-	out chan<- domain.MarketTick,
-) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectAndRead(ctx, url, mType, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Binance %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
-}
-
 func (a *Adapter) connectAndRead(
 	ctx context.Context,
 	url string,

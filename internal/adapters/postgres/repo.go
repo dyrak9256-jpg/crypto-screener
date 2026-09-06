@@ -86,6 +86,7 @@ func (r *Repository) SaveSignal(ctx context.Context, s *domain.ArbitrageSignal) 
 		s.InitialSpread.String(), s.PeakSpread.String(), s.FinalSpread.String(),
 		s.QuoteVolume.String(), s.FundingRate.String(), nextFundingPtr(s.NextFunding),
 		s.Duration.Milliseconds(),
+		s.QuoteVolume.String(),
 	)
 	if err != nil {
 		return fmt.Errorf("save signal %s: %w", s.ID, err)
@@ -183,7 +184,7 @@ func (r *Repository) GetUserByChatID(ctx context.Context, chatID int64) (*domain
 }
 
 // scanUser читает одну строку и возвращает User
-// Выделено отдельно чтобы не дублировать логику в GetAllUsers и GetUserByChatID
+// Выделено отдельно чтобы не дублировать логику в GetAllUsers (и других методах users)
 func scanUser(rows interface {
 	Scan(dest ...any) error
 }) (*domain.User, error) {

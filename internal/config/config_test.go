@@ -47,3 +47,16 @@ func TestConfig_Load_MissingDatabaseURLFails(t *testing.T) {
 	_, err := Load()
 	require.Error(t, err)
 }
+
+func TestConfig_Load_InvalidSpreadFallsBackToDefault(t *testing.T) {
+	// Некорректное значение HARD_MIN_SPREAD не должно обнулять порог (это
+	// отключило бы фильтрацию сигналов) — фолбэк на дефолт 0.01.
+	t.Setenv("HARD_MIN_SPREAD", "not-a-number")
+	t.Setenv("HARD_MIN_VOLUME", "not-a-number")
+
+	cfg := Load()
+	assert.True(t, cfg.HardMinSpread.Equal(decimal.RequireFromString("0.01")),
+		"invalid spread must fall back to 0.01")
+	assert.True(t, cfg.HardMinVolume.Equal(decimal.RequireFromString("1000000")),
+		"invalid volume must fall back to 1000000")
+}
