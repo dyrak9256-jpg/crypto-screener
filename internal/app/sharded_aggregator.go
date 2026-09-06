@@ -182,7 +182,7 @@ func (sa *ShardedAggregator) calculateCrossExchange(symbol string, exchanges map
 
 	// Используем жесткий лимит разработчика, чтобы не пропустить сигнал ни для кого
 	if spread.GreaterThanOrEqual(sa.config.GetHardMinSpread()) {
-		if sa.funding.IsArbProfitable(symbol, spread, ts) {
+		if sa.funding.IsArbProfitable(symbol, spread, ts, minEx, maxEx) {
 			sa.sendEventNonBlocking(domain.SpreadEvent{
 				Symbol: symbol, SpreadType: domain.CrossExchange, Spread: spread,
 				ExchangeA: minEx, ExchangeB: maxEx, QuoteVolume: qVol, Timestamp: ts,
@@ -199,7 +199,7 @@ func (sa *ShardedAggregator) calculateIntraExchange(symbol, exchange string, sta
 	spread := state.Futures.Sub(state.Spot).Abs().Div(state.Spot)
 
 	if spread.GreaterThanOrEqual(sa.config.GetHardMinSpread()) {
-		if sa.funding.IsArbProfitable(symbol, spread, ts) {
+		if sa.funding.IsArbProfitable(symbol, spread, ts, exchange) {
 			sa.sendEventNonBlocking(domain.SpreadEvent{
 				Symbol: symbol, SpreadType: domain.IntraExchange, Spread: spread,
 				ExchangeA: exchange, ExchangeB: exchange, QuoteVolume: qVol, Timestamp: ts,

@@ -45,7 +45,6 @@ type Application struct {
 
 func NewApplication(
 	cfg *domain.ScreenerConfig,
-	repo domain.SignalRepository,
 	userRepo domain.UserRepository,
 ) *Application {
 	tickChan := make(chan domain.MarketTick, 200_000)

@@ -24,7 +24,6 @@ func TestApplication_HandleCommand(t *testing.T) {
 	hardVol := decimal.RequireFromString("1000000") // 1M USDT
 	cfg := domain.NewScreenerConfig(hardSpread, hardVol)
 
-	mockSignalRepo := mocks.NewMockSignalRepository(ctrl)
 	mockUserRepo := mocks.NewMockUserRepository(ctrl)
 
 	// Expectations for async user repo calls
@@ -38,7 +37,7 @@ func TestApplication_HandleCommand(t *testing.T) {
 		Return(nil).
 		AnyTimes()
 
-	app := NewApplication(cfg, mockSignalRepo, mockUserRepo)
+	app := NewApplication(cfg, mockUserRepo)
 	appCtx := context.Background()
 	app.ctx.Store(&appCtx)
 	require.NotNil(t, app)
@@ -182,7 +181,7 @@ func TestApplication_Run_PreloadsUsersAndGracefulShutdown(t *testing.T) {
 		}, nil).
 		Times(1)
 
-	app := NewApplication(cfg, mockSignalRepo, mockUserRepo)
+	app := NewApplication(cfg, mockUserRepo)
 
 	mockTg := mocks.NewMockTelegramSender(ctrl)
 	app.SetTelegramSender(mockTg)

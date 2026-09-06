@@ -263,7 +263,7 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 		symbol := "XRPUSDT"
 
 		// Set funding rate higher than spread: rate = 10%
-		funding.UpdateFunding(symbol, decimal.RequireFromString("0.10"), now.Add(2*time.Hour))
+		funding.UpdateFunding("BINANCE", symbol, decimal.RequireFromString("0.10"), now.Add(2*time.Hour))
 
 		// Spread will be (103 - 100) / 100 = 3% < 10% funding
 		sa.ProcessTick(domain.MarketTick{
