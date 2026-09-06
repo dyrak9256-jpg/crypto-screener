@@ -70,12 +70,22 @@ func NewAdapter() *Adapter {
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
+	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
+	return nil
+}
+
+// ConnectFunding — BYBIT не предоставляет поток ставок финансирования через
+// этот коннектор. Блокируем до завершения контекста, чтобы supervisor-горутина
+// (runWithReconnect) не зациклилась на переподключениях.
+// Отсутствие данных о funding означает, что фильтр по funding остаётся
+// пермиссивным (сигнал считается прибыльным).
+func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
+	<-ctx.Done()
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
+	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
 	return nil
 }
 

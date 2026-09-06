@@ -45,17 +45,17 @@ type Adapter struct{}
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
+	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	go a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
+	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
-	go a.listenFunding(ctx, sink)
+	a.listenFunding(ctx, sink)
 	return nil
 }
 
@@ -234,7 +234,7 @@ func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.Funding
 
 		for _, p := range payloads {
 			rate, _ := decimal.NewFromString(p.FundingRate)
-			sink.UpdateFunding(p.Symbol, rate, time.UnixMilli(p.NextFundingTime))
+			sink.UpdateFunding("BINANCE", p.Symbol, rate, time.UnixMilli(p.NextFundingTime))
 		}
 	}
 }

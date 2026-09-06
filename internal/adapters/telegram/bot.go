@@ -22,8 +22,10 @@ const (
 	retryAfterDefault = 5 * time.Second
 )
 
-// ✅ Глобальный replacer — создаётся один раз, используется многократно
-// Аллокация при каждом вызове EscapeMarkdownV2 недопустима при высокой нагрузке
+// ✅ Глобальный replacer — создаётся один раз, используется многократно.
+// Применяется к динамическим (пользовательским) значениям, чтобы не
+// позволить инъекции markdown-разметки. Статические шаблоны сообщений
+// НЕ экранируются (они намеренно содержат `*bold*` и “ `code` “).
 var mdV2Replacer = strings.NewReplacer(
 	"_", "\\_",
 	"*", "\\*",
@@ -105,19 +107,18 @@ func (b *Bot) sendWorker() {
 	}
 }
 
-// SendPrivateMessage отправляет сообщение конкретному пользователю
-// Блокирующая отправка для личных ответов — не должны теряться
+// SendPrivateMessage отправляет сообщение конкретному пользователю.
+// Неблокирующая отправка: при заполненном буфере сообщение отбрасывается
+// (см. ARCHITECTURE.md «Non-Blocking Sends»), чтобы не блокировать
+// polling-горутину и обработку команд.
 func (b *Bot) SendPrivateMessage(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, EscapeMarkdownV2(text))
-	msg.ParseMode = tgbotapi.ModeMarkdownV2
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeMarkdown
 
-	// ✅ Блокирующая отправка для личных ответов на команды
-	// Если канал полон — используем select с таймаутом
-	// чтобы не заблокировать polling горутину навсегда
 	select {
 	case b.sendChan <- msg:
-	case <-time.After(5 * time.Second):
-		log.Printf("⚠️  Telegram: send timeout for chat_id %d, message dropped", chatID)
+	default:
+		log.Printf("⚠️  Telegram: sendChan full, reply to chat_id %d dropped", chatID)
 	}
 }
 
@@ -128,12 +129,10 @@ func (b *Bot) Broadcast(text string, chatIDs []int64) {
 		return
 	}
 
-	formattedText := EscapeMarkdownV2(text)
-
 	var dropped int
 	for _, id := range chatIDs {
-		msg := tgbotapi.NewMessage(id, formattedText)
-		msg.ParseMode = tgbotapi.ModeMarkdownV2
+		msg := tgbotapi.NewMessage(id, text)
+		msg.ParseMode = tgbotapi.ModeMarkdown
 
 		select {
 		case b.sendChan <- msg:

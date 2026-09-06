@@ -10,7 +10,8 @@ CREATE TABLE signals (
     initial_spread NUMERIC(20, 8) NOT NULL,
     peak_spread NUMERIC(20, 8) NOT NULL,
     final_spread NUMERIC(20, 8),
-    duration_ms BIGINT
+    duration_ms BIGINT,
+    quote_volume NUMERIC(20, 8) NOT NULL DEFAULT 0   -- 24h rolling quote volume на момент сигнала
 );
 
 

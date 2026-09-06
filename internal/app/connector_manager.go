@@ -142,9 +142,9 @@ var ErrManagerStopped = errors.New("connector manager is stopped")
 // Если коннектор уже существует — корректно останавливает старый (Hot-Swap).
 // Потокобезопасен. Не удерживает мьютекс во время ожидания остановки.
 func (cm *ConnectorManager) AddConnector(
-	parentCtx context.Context,
 	name string,
 	conn domain.ExchangeConnector,
+	parentCtx context.Context,
 ) error {
 	// Фаза 1: извлекаем старый entry под мьютексом, не блокируя надолго.
 	cm.mu.Lock()

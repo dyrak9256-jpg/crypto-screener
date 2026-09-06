@@ -33,23 +33,24 @@ func TestBinanceAdapter_ConnectAndRead_TickerStream(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// 1. Send valid ticker payload
-		validMsg := tickerPayload{
+		// 1. Send valid ticker payload.
+		// Для `!ticker@arr` сервер шлёт МАССИВ тикеров; адаптер ожидает слайс.
+		validMsg := []tickerPayload{{
 			Symbol:  "BTCUSDT",
 			BestBid: "65000.50",
 			BestAsk: "65001.50",
 			QVolume: "1234567.89",
-		}
+		}}
 		bytes, _ := sonic.Marshal(validMsg)
 		_ = conn.WriteMessage(websocket.TextMessage, bytes)
 
 		// 2. Send ticker payload with zero bid (should be filtered out)
-		zeroBidMsg := tickerPayload{
+		zeroBidMsg := []tickerPayload{{
 			Symbol:  "ETHUSDT",
 			BestBid: "0",
 			BestAsk: "3500.00",
 			QVolume: "500000",
-		}
+		}}
 		bytes, _ = sonic.Marshal(zeroBidMsg)
 		_ = conn.WriteMessage(websocket.TextMessage, bytes)
 
@@ -112,7 +113,7 @@ type testFundingSink struct {
 	updates map[string]decimal.Decimal
 }
 
-func (s *testFundingSink) UpdateFunding(symbol string, rate decimal.Decimal, nextTime time.Time) {
+func (s *testFundingSink) UpdateFunding(exchange string, symbol string, rate decimal.Decimal, nextTime time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.updates[symbol] = rate
@@ -138,7 +139,7 @@ func TestBinanceAdapter_FundingPayload_UnmarshalAndDispatch(t *testing.T) {
 		rate, err := decimal.NewFromString(p.FundingRate)
 		require.NoError(t, err)
 		nextTime := time.UnixMilli(p.NextFundingTime)
-		sink.UpdateFunding(p.Symbol, rate, nextTime)
+		sink.UpdateFunding("BINANCE", p.Symbol, rate, nextTime)
 	}
 
 	sink.mu.Lock()
@@ -187,7 +188,7 @@ func TestBinanceAdapter_ConnectAndRead_DialError(t *testing.T) {
 	// Invalid port to trigger dial error
 	err := adapter.connectAndRead(ctx, "ws://127.0.0.1:1", domain.MarketTypeSpot, outChan)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "dial error")
+	assert.Contains(t, err.Error(), "dial:")
 }
 
 func TestBinanceAdapter_Listen_ReconnectionContextDone(t *testing.T) {
@@ -212,12 +213,12 @@ func TestBinanceAdapter_ConnectAndRead_ChannelFullDrop(t *testing.T) {
 		}
 		defer conn.Close()
 
-		msg := tickerPayload{
+		msg := []tickerPayload{{
 			Symbol:  "BTCUSDT",
 			BestBid: "65000",
 			BestAsk: "65001",
 			QVolume: "100",
-		}
+		}}
 		bytes, _ := sonic.Marshal(msg)
 		_ = conn.WriteMessage(websocket.TextMessage, bytes)
 

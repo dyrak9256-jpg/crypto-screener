@@ -228,7 +228,11 @@ func TestBot_SendWorker_And_StartPolling(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 1. Start sendWorker in background
+	// 1. Start sendWorker in background.
+	// В NewBot() существуют b.wg.Add(1) перед запуском; здесь Bot создан
+	// напрямую, поэтому регистрируем горутину вручную, иначе defer
+	// b.wg.Done() вызовет negative WaitGroup counter.
+	bot.wg.Add(1)
 	go bot.sendWorker()
 
 	// 2. Start Polling in background

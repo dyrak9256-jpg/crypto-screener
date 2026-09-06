@@ -110,15 +110,15 @@ func (m *MockFundingSink) EXPECT() *MockFundingSinkMockRecorder {
 }
 
 // UpdateFunding mocks base method.
-func (m *MockFundingSink) UpdateFunding(symbol string, rate decimal.Decimal, nextTime time.Time) {
+func (m *MockFundingSink) UpdateFunding(exchange, symbol string, rate decimal.Decimal, nextTime time.Time) {
 	m.ctrl.T.Helper()
-	m.ctrl.Call(m, "UpdateFunding", symbol, rate, nextTime)
+	m.ctrl.Call(m, "UpdateFunding", exchange, symbol, rate, nextTime)
 }
 
 // UpdateFunding indicates an expected call of UpdateFunding.
-func (mr *MockFundingSinkMockRecorder) UpdateFunding(symbol, rate, nextTime any) *gomock.Call {
+func (mr *MockFundingSinkMockRecorder) UpdateFunding(exchange, symbol, rate, nextTime any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateFunding", reflect.TypeOf((*MockFundingSink)(nil).UpdateFunding), symbol, rate, nextTime)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateFunding", reflect.TypeOf((*MockFundingSink)(nil).UpdateFunding), exchange, symbol, rate, nextTime)
 }
 
 // MockTelegramSender is a mock of TelegramSender interface.

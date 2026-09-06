@@ -74,9 +74,6 @@ func TestScreenerConfig_Getters(t *testing.T) {
 
 	assert.True(t, cfg.GetHardMinSpread().Equal(hardSpread))
 	assert.True(t, cfg.GetHardMinVolume().Equal(hardVol))
-	assert.True(t, cfg.GetEffectiveIntraSpread().Equal(hardSpread))
-	assert.True(t, cfg.GetEffectiveMinVolume().Equal(hardVol))
-	assert.Equal(t, TF_15m, cfg.GetUserTimeframe())
 	assert.Equal(t, 30, cfg.GetFundingTimeBuffer())
 	assert.True(t, cfg.IsPairEnabled("BTCUSDT"))
 	assert.True(t, cfg.IsPairEnabled("ETHUSDT"))

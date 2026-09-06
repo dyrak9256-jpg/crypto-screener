@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"crypto-screener/internal/adapters/binance"
+	"crypto-screener/internal/adapters"
 	"crypto-screener/internal/domain"
 
 	"github.com/shopspring/decimal"
@@ -87,8 +87,12 @@ func (a *Application) GetConnectorManager() *ConnectorManager {
 }
 
 func (a *Application) isAdmin(chatID int64) bool {
+	// Если список админов не задан (ADMIN_CHAT_IDS пуст) — доступ к
+	// административным командам (/addex, /rmex) запрещён всем.
+	// Раньше пустой список означал «все админы» — это позволяло любому
+	// пользователю менять активные биржевые коннекторы на живом сервисе.
 	if len(a.adminIDs) == 0 {
-		return true
+		return false
 	}
 	for _, id := range a.adminIDs {
 		if chatID == id {
@@ -359,14 +363,13 @@ func (a *Application) HandleCommand(chatID int64, username, cmd string, args []s
 			return "Usage: /addex <exchange>"
 		}
 		name := strings.ToUpper(args[0])
-		var conn domain.ExchangeConnector
-		switch name {
-		case "BINANCE":
-			conn = binance.NewAdapter()
-		default:
-			return fmt.Sprintf("❌ Exchange %s not supported", name)
+		conn, err := adapters.NewByName(name)
+		if err != nil {
+			return fmt.Sprintf("❌ %v", err)
 		}
-		a.connManager.AddConnector(name, conn, appCtx)
+		if err := a.connManager.AddConnector(name, conn, appCtx); err != nil {
+			return fmt.Sprintf("❌ Failed to add %s: %v", name, err)
+		}
 		return fmt.Sprintf("✅ Hot-swapped IN: %s", name)
 
 	case "rmex":

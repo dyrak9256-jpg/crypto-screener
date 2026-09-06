@@ -39,7 +39,8 @@ func TestApplication_HandleCommand(t *testing.T) {
 		AnyTimes()
 
 	app := NewApplication(cfg, mockSignalRepo, mockUserRepo)
-	app.ctx = context.Background()
+	appCtx := context.Background()
+	app.ctx.Store(&appCtx)
 	require.NotNil(t, app)
 
 	chatID := int64(99901)
@@ -77,7 +78,7 @@ func TestApplication_HandleCommand(t *testing.T) {
 
 	// Invalid number
 	resp = app.HandleCommand(chatID, username, "setcross", []string{"not-a-number"})
-	assert.Contains(t, resp, "Invalid number")
+	assert.Contains(t, resp, "Некорректное число")
 
 	// Valid number above hard limit (2.5%)
 	resp = app.HandleCommand(chatID, username, "setcross", []string{"2.5"})
@@ -98,7 +99,7 @@ func TestApplication_HandleCommand(t *testing.T) {
 
 	// Invalid number
 	resp = app.HandleCommand(chatID, username, "setvol", []string{"xyz"})
-	assert.Contains(t, resp, "Invalid number")
+	assert.Contains(t, resp, "Некорректный объём")
 
 	// Valid number above hard limit ($2,000,000)
 	resp = app.HandleCommand(chatID, username, "setvol", []string{"2000000"})
@@ -119,7 +120,7 @@ func TestApplication_HandleCommand(t *testing.T) {
 
 	// Invalid timeframe
 	resp = app.HandleCommand(chatID, username, "settimeframe", []string{"10m"})
-	assert.Contains(t, resp, "Invalid timeframe")
+	assert.Contains(t, resp, "Неверный таймфрейм")
 
 	// Valid timeframe
 	validTFs := []string{"1m", "5m", "15m", "30m", "1h", "4h", "24h"}
@@ -131,6 +132,9 @@ func TestApplication_HandleCommand(t *testing.T) {
 	}
 
 	// 7. /addex and /rmex
+	// Административные команды: делаем текущего пользователя админом.
+	app.SetAdminIDs([]int64{chatID})
+
 	// No args
 	assert.Contains(t, app.HandleCommand(chatID, username, "addex", nil), "Usage: /addex")
 	assert.Contains(t, app.HandleCommand(chatID, username, "rmex", nil), "Usage: /rmex")
@@ -147,7 +151,7 @@ func TestApplication_HandleCommand(t *testing.T) {
 
 	// 8. Unknown command
 	resp = app.HandleCommand(chatID, username, "unknown_cmd", nil)
-	assert.Contains(t, resp, "Unknown command")
+	assert.Contains(t, resp, "Неизвестная команда")
 
 	// 9. /stop: Unsubscribe
 	resp = app.HandleCommand(chatID, username, "stop", nil)

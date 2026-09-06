@@ -26,6 +26,7 @@ type MarketTick struct {
 }
 
 type FundingRate struct {
+	Exchange        string // Биржа-источник ставки (например, "BINANCE")
 	Symbol          string
 	Rate            decimal.Decimal
 	NextFundingTime time.Time
