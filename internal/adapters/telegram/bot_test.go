@@ -35,6 +35,7 @@ func TestBot_SendPrivateMessage_And_Broadcast(t *testing.T) {
 	sendChan := make(chan tgbotapi.Chattable, 10)
 	bot := &Bot{
 		sendChan: sendChan,
+		done:     make(chan struct{}),
 	}
 
 	// 1. SendPrivateMessage
@@ -58,10 +59,14 @@ func TestBot_SendPrivateMessage_And_Broadcast(t *testing.T) {
 		assert.Equal(t, "Markdown", bMsg.ParseMode)
 	}
 
-	// 3. Close
+	// 3. Close: идемпотентно; sendChan НЕ закрывается (нет send-on-closed-channel).
 	bot.Close()
-	_, ok := <-sendChan
-	assert.False(t, ok, "sendChan should be closed after Close()")
+	bot.Close() // идемпотентно
+	// После Close() отправки — no-op, не паника и не добавление в очередь.
+	bot.SendPrivateMessage(999, "after close")
+	bot.Broadcast("after close", []int64{9, 10})
+	require.Len(t, sendChan, 0, "no messages may be enqueued after Close()")
+	assert.NotPanics(t, func() { bot.Close() })
 }
 
 func TestBot_NonBlockingDropWhenFull(t *testing.T) {
@@ -71,6 +76,7 @@ func TestBot_NonBlockingDropWhenFull(t *testing.T) {
 	sendChan := make(chan tgbotapi.Chattable, 2)
 	bot := &Bot{
 		sendChan: sendChan,
+		done:     make(chan struct{}),
 	}
 
 	// Fill buffer completely
@@ -223,6 +229,7 @@ func TestBot_SendWorker_And_StartPolling(t *testing.T) {
 		api:        api,
 		cmdHandler: mockHandler,
 		sendChan:   make(chan tgbotapi.Chattable, 10),
+		done:       make(chan struct{}),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -23,9 +23,6 @@ const (
 )
 
 // ✅ Глобальный replacer — создаётся один раз, используется многократно.
-// Применяется к динамическим (пользовательским) значениям, чтобы не
-// позволить инъекции markdown-разметки. Статические шаблоны сообщений
-// НЕ экранируются (они намеренно содержат `*bold*` и “ `code` “).
 var mdV2Replacer = strings.NewReplacer(
 	"_", "\\_",
 	"*", "\\*",
@@ -52,6 +49,10 @@ type Bot struct {
 	sendChan   chan tgbotapi.Chattable
 	cmdHandler domain.CommandHandler
 	wg         sync.WaitGroup
+	// done закрывается в Close(). sendChan НЕ закрывается: это исключает
+	// «send on closed channel» при гонке продюсера (polling-команда) с Close().
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
@@ -64,6 +65,7 @@ func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
 		api:        api,
 		cmdHandler: handler,
 		sendChan:   make(chan tgbotapi.Chattable, sendChanBuffer),
+		done:       make(chan struct{}),
 	}
 
 	b.wg.Add(1)
@@ -72,58 +74,89 @@ func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
 	return b, nil
 }
 
-// sendWorker обрабатывает очередь сообщений с учётом rate limits Telegram
-// Лимиты: 30 msg/sec глобально, 1 msg/sec в один чат
+// sendWorker обрабатывает очередь сообщений с учётом rate limits Telegram.
+// Завершается по закрытию done, предварительно дочитав оставшиеся сообщения.
 func (b *Bot) sendWorker() {
 	defer b.wg.Done()
 
 	ticker := time.NewTicker(sendInterval)
 	defer ticker.Stop()
 
-	for msg := range b.sendChan {
-		<-ticker.C
-
-		if _, err := b.api.Send(msg); err != nil {
-			// ✅ Обработка 429 Too Many Requests
-			// Telegram возвращает retry_after в секундах
-			var tgErr *tgbotapi.Error
-			if errors.As(err, &tgErr) && tgErr.Code == 429 {
-				retryAfter := retryAfterDefault
-				if tgErr.RetryAfter > 0 {
-					retryAfter = time.Duration(tgErr.RetryAfter) * time.Second
-				}
-				log.Printf("⚠️  Telegram 429: retry after %s", retryAfter)
-				time.Sleep(retryAfter)
-
-				// Повторяем отправку после паузы
-				if _, retryErr := b.api.Send(msg); retryErr != nil {
-					log.Printf("⚠️  Telegram retry failed: %v", retryErr)
-				}
-				continue
-			}
-
-			log.Printf("⚠️  Telegram send error: %v", err)
+	for {
+		select {
+		case <-b.done:
+			// Дочитываем и отправляем всё, что осталось в очереди, затем выходим.
+			b.drain(ticker)
+			return
+		case msg := <-b.sendChan:
+			<-ticker.C
+			b.doSend(msg)
 		}
 	}
 }
 
-// SendPrivateMessage отправляет сообщение конкретному пользователю.
-// Неблокирующая отправка: при заполненном буфере сообщение отбрасывается
-// (см. ARCHITECTURE.md «Non-Blocking Sends»), чтобы не блокировать
-// polling-горутину и обработку команд.
-func (b *Bot) SendPrivateMessage(chatID int64, text string) {
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = tgbotapi.ModeMarkdown
-
-	select {
-	case b.sendChan <- msg:
-	default:
-		log.Printf("⚠️  Telegram: sendChan full, reply to chat_id %d dropped", chatID)
+// drain отправляет оставшиеся в очереди сообщения без блокировки.
+func (b *Bot) drain(ticker *time.Ticker) {
+	for {
+		select {
+		case msg := <-b.sendChan:
+			<-ticker.C
+			b.doSend(msg)
+		default:
+			return
+		}
 	}
 }
 
-// Broadcast рассылает сообщение всем пользователям
-// Использует non-blocking send — сигналы менее критичны чем личные ответы
+func (b *Bot) doSend(msg tgbotapi.Chattable) {
+	if _, err := b.api.Send(msg); err != nil {
+		var tgErr *tgbotapi.Error
+		if errors.As(err, &tgErr) && tgErr.Code == 429 {
+			retryAfter := retryAfterDefault
+			if tgErr.RetryAfter > 0 {
+				retryAfter = time.Duration(tgErr.RetryAfter) * time.Second
+			}
+			log.Printf("⚠️  Telegram 429: retry after %s", retryAfter)
+			time.Sleep(retryAfter)
+			if _, retryErr := b.api.Send(msg); retryErr != nil {
+				log.Printf("⚠️  Telegram retry failed: %v", retryErr)
+			}
+			return
+		}
+		log.Printf("⚠️  Telegram send error: %v", err)
+	}
+}
+
+// trySend отправляет сообщение неблокирующе. После Close() (done закрыт)
+// возвращает false и ничего не отправляет — это защищает от «send on closed
+// channel» и не блокирует вызывающего.
+func (b *Bot) trySend(msg tgbotapi.Chattable) bool {
+	select {
+	case <-b.done:
+		return false
+	default:
+	}
+	select {
+	case b.sendChan <- msg:
+		return true
+	case <-b.done:
+		return false
+	default:
+		return false
+	}
+}
+
+// SendPrivateMessage отправляет сообщение конкретному пользователю.
+// Неблокирующая отправка: при заполненном буфере сообщение отбрасывается.
+func (b *Bot) SendPrivateMessage(chatID int64, text string) {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeMarkdown
+	if !b.trySend(msg) {
+		log.Printf("⚠️  Telegram: sendChan full or bot closed, reply to chat_id %d dropped", chatID)
+	}
+}
+
+// Broadcast рассылает сообщение всем пользователям. Неблокирующе.
 func (b *Bot) Broadcast(text string, chatIDs []int64) {
 	if len(chatIDs) == 0 {
 		return
@@ -133,25 +166,23 @@ func (b *Bot) Broadcast(text string, chatIDs []int64) {
 	for _, id := range chatIDs {
 		msg := tgbotapi.NewMessage(id, text)
 		msg.ParseMode = tgbotapi.ModeMarkdown
-
-		select {
-		case b.sendChan <- msg:
-		default:
+		if !b.trySend(msg) {
 			dropped++
 		}
 	}
 
 	if dropped > 0 {
-		log.Printf("⚠️  Telegram Broadcast: dropped %d/%d messages (buffer full)",
-			dropped, len(chatIDs))
+		log.Printf("⚠️  Telegram Broadcast: dropped %d/%d messages", dropped, len(chatIDs))
 	}
 }
 
-// Close корректно завершает работу:
-// 1. Закрывает канал — sendWorker получит сигнал завершения
-// 2. Ждёт пока sendWorker отправит все оставшиеся сообщения из буфера
+// Close корректно и ИДЕМПОТЕНТНО завершает работу: сигналит sendWorker о
+// необходимости дочитать очередь и остановиться, затем ждёт его завершения.
+// sendChan при этом не закрывается — нет «send on closed channel».
 func (b *Bot) Close() {
-	close(b.sendChan)
+	if b.done != nil {
+		b.closeOnce.Do(func() { close(b.done) })
+	}
 	b.wg.Wait()
 }
 
@@ -177,7 +208,6 @@ func (b *Bot) StartPolling(ctx context.Context) {
 
 			chatID := update.Message.Chat.ID
 
-			// Получаем username: сначала из From, потом из Chat
 			username := update.Message.From.UserName
 			if username == "" {
 				username = update.Message.Chat.UserName
@@ -190,8 +220,8 @@ func (b *Bot) StartPolling(ctx context.Context) {
 				args = strings.Fields(argStr)
 			}
 
-			// Обрабатываем команду в отдельной горутине
-			// чтобы медленный handler не блокировал получение следующих обновлений
+			// Обрабатываем команду в отдельной горутине, чтобы медленный handler
+			// не блокировал получение следующих обновлений.
 			go func(cid int64, uname, command string, arguments []string) {
 				response := b.cmdHandler.HandleCommand(cid, uname, command, arguments)
 				b.SendPrivateMessage(cid, response)
@@ -201,7 +231,6 @@ func (b *Bot) StartPolling(ctx context.Context) {
 }
 
 // EscapeMarkdownV2 экранирует все спецсимволы Telegram MarkdownV2
-// Использует глобальный replacer — zero allocation per call
 func EscapeMarkdownV2(text string) string {
 	return mdV2Replacer.Replace(text)
 }

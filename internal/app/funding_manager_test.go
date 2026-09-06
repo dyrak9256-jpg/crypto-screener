@@ -70,9 +70,9 @@ func TestFundingManager_TimeBuffer(t *testing.T) {
 			t.Parallel()
 
 			fm := NewFundingManager(cfg)
-			fm.UpdateFunding("BTCUSDT", lowRate, now.Add(tc.nextFundingOffset))
+			fm.UpdateFunding("BINANCE", "BTCUSDT", lowRate, now.Add(tc.nextFundingOffset))
 
-			isProfitable := fm.IsArbProfitable("BTCUSDT", spread, now)
+			isProfitable := fm.IsArbProfitable("BTCUSDT", spread, now, "BINANCE")
 			assert.Equal(t, tc.expectedResult, isProfitable)
 		})
 	}
@@ -148,9 +148,9 @@ func TestFundingManager_Profitability(t *testing.T) {
 			t.Parallel()
 
 			fm := NewFundingManager(cfg)
-			fm.UpdateFunding("ETHUSDT", tc.rate, safeFundingTime)
+			fm.UpdateFunding("BINANCE", "ETHUSDT", tc.rate, safeFundingTime)
 
-			isProfitable := fm.IsArbProfitable("ETHUSDT", tc.spread, now)
+			isProfitable := fm.IsArbProfitable("ETHUSDT", tc.spread, now, "BINANCE")
 			assert.Equal(t, tc.expectedResult, isProfitable)
 		})
 	}
@@ -177,10 +177,10 @@ func TestFundingManager_UpdateFunding_OverwritesPreviousRate(t *testing.T) {
 	safeTime := now.Add(2 * time.Hour)
 
 	// Initially unprofitable due to high rate
-	fm.UpdateFunding("SOLUSDT", decimal.RequireFromString("0.05"), safeTime)
-	assert.False(t, fm.IsArbProfitable("SOLUSDT", decimal.RequireFromString("0.02"), now))
+	fm.UpdateFunding("BINANCE", "SOLUSDT", decimal.RequireFromString("0.05"), safeTime)
+	assert.False(t, fm.IsArbProfitable("SOLUSDT", decimal.RequireFromString("0.02"), now, "BINANCE"))
 
 	// Update to low rate -> should now be profitable
-	fm.UpdateFunding("SOLUSDT", decimal.RequireFromString("0.001"), safeTime)
-	assert.True(t, fm.IsArbProfitable("SOLUSDT", decimal.RequireFromString("0.02"), now))
+	fm.UpdateFunding("BINANCE", "SOLUSDT", decimal.RequireFromString("0.001"), safeTime)
+	assert.True(t, fm.IsArbProfitable("SOLUSDT", decimal.RequireFromString("0.02"), now, "BINANCE"))
 }

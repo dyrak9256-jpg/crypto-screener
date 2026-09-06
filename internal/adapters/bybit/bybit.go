@@ -70,8 +70,7 @@ func NewAdapter() *Adapter {
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
-	return nil
+	return a.connectAndRead(ctx, spotWS, domain.MarketTypeSpot, out)
 }
 
 // ConnectFunding — BYBIT не предоставляет поток ставок финансирования через
@@ -85,32 +84,7 @@ func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) e
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
-	return nil
-}
-
-func (a *Adapter) listen(
-	ctx context.Context,
-	url string,
-	mType domain.MarketType,
-	out chan<- domain.MarketTick,
-) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectAndRead(ctx, url, mType, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Bybit %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
+	return a.connectAndRead(ctx, futuresWS, domain.MarketTypeFutures, out)
 }
 
 func (a *Adapter) connectAndRead(

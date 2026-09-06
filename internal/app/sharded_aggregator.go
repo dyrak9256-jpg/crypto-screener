@@ -12,9 +12,23 @@ import (
 
 const numShards = 1024
 
+// staleWindow — максимально допустимый возраст тика. Данные старше считаются
+// устаревшими и исключаются из расчёта (нельзя арбитражить по устаревшей цене).
+const staleWindow = 15 * time.Second
+
+// intervalVolumeTF — таймфрейм, по которому считается "интервальный" объём,
+// попадающий в SpreadEvent.QuoteVolume. Это НЕ 24h-rolling с биржи: объём
+// выводcтся из накопленных минутных дельт (см. getSymbolVolumeInternal).
+const intervalVolumeTF = domain.TF_5m
+
+// PriceState хранит ЛУЧШИЕ цены спроса/предложения отдельно для спота и фьючерсов.
+// Mid-price больше НЕ используется для исполняемого спреда: спред считается по
+// bid/ask-маршруту (купля по ask, продажа по bid).
 type PriceState struct {
-	Spot    decimal.Decimal
-	Futures decimal.Decimal
+	SpotBid    decimal.Decimal
+	SpotAsk    decimal.Decimal
+	FuturesBid decimal.Decimal
+	FuturesAsk decimal.Decimal
 }
 
 type SymbolVolumeState struct {
@@ -34,6 +48,8 @@ type ShardedAggregator struct {
 	trackerChan chan<- domain.SpreadEvent
 	funding     *FundingManager
 	config      *domain.ScreenerConfig
+	// staleWindow — максимальный допустимый возраст тика (переопределяется в тестах).
+	staleWindow time.Duration
 }
 
 func NewShardedAggregator(trackerChan chan<- domain.SpreadEvent, funding *FundingManager, cfg *domain.ScreenerConfig) *ShardedAggregator {
@@ -41,15 +57,25 @@ func NewShardedAggregator(trackerChan chan<- domain.SpreadEvent, funding *Fundin
 	for i := 0; i < numShards; i++ {
 		sa.shards[i] = &Shard{prices: make(map[string]map[string]*PriceState), volumes: make(map[string]*SymbolVolumeState)}
 	}
+	sa.staleWindow = staleWindow
 	return sa
 }
 
+// ProcessTick валидирует и нормализует входящий тик, затем проверяет спреды.
 func (sa *ShardedAggregator) ProcessTick(tick domain.MarketTick) {
+	// Валидация bid/ask: bid>0, ask>0, bid<=ask. Некорректные тики отбрасываются.
+	if !tick.BestBid.IsPositive() || !tick.BestAsk.IsPositive() || tick.BestBid.GreaterThan(tick.BestAsk) {
+		return
+	}
+	// Исключение устаревших данных.
+	if now := time.Now(); now.Sub(tick.Timestamp) > sa.staleWindow {
+		return
+	}
+
 	shardIdx := int(crc32.ChecksumIEEE([]byte(tick.Symbol)) % numShards)
 	shard := sa.shards[shardIdx]
 
 	shard.mu.Lock()
-	defer shard.mu.Unlock()
 
 	if shard.prices[tick.Symbol] == nil {
 		shard.prices[tick.Symbol] = make(map[string]*PriceState)
@@ -58,25 +84,37 @@ func (sa *ShardedAggregator) ProcessTick(tick domain.MarketTick) {
 		shard.prices[tick.Symbol][tick.Exchange] = &PriceState{}
 	}
 
-	midPrice := tick.BestBid.Add(tick.BestAsk).Div(decimal.NewFromInt(2))
 	state := shard.prices[tick.Symbol][tick.Exchange]
 	if tick.MarketType == domain.MarketTypeSpot {
-		state.Spot = midPrice
+		state.SpotBid = tick.BestBid
+		state.SpotAsk = tick.BestAsk
 	} else {
-		state.Futures = midPrice
+		state.FuturesBid = tick.BestBid
+		state.FuturesAsk = tick.BestAsk
 	}
 
 	sa.updateVolumeState(shard, tick.Symbol, tick.QuoteVolume, tick.Timestamp)
 
 	if !sa.config.IsPairEnabled(tick.Symbol) {
+		shard.mu.Unlock()
 		return
 	}
 
-	// Передаем 24h объем в качестве базового ориентира
-	current24hVol := tick.QuoteVolume
+	// Интервальный объём (из минутных дельт), а НЕ 24h-rolling с биржи.
+	intervalVol := sa.getSymbolVolumeInternal(shard, tick.Symbol, intervalVolumeTF, tick.Timestamp)
 
-	sa.calculateCrossExchange(tick.Symbol, shard.prices[tick.Symbol], tick.Timestamp, current24hVol)
-	sa.calculateIntraExchange(tick.Symbol, tick.Exchange, state, tick.Timestamp, current24hVol)
+	// Считаем события УДЕРЖИВАЯ мьютекс, но отправляем ПОСЛЕ снятия —
+	// не блокируем запись в канал под блокировкой на shard.
+	cross := sa.calculateCrossExchange(tick.Symbol, shard.prices[tick.Symbol], tick.Timestamp, intervalVol)
+	intra := sa.calculateIntraExchange(tick.Symbol, tick.Exchange, state, tick.Timestamp, intervalVol)
+	shard.mu.Unlock()
+
+	if cross != nil {
+		sa.sendEvent(cross)
+	}
+	if intra != nil {
+		sa.sendEvent(intra)
+	}
 }
 
 // GetSymbolVolume реализует интерфейс domain.VolumeProvider
@@ -150,67 +188,84 @@ func (sa *ShardedAggregator) getSymbolVolumeInternal(shard *Shard, symbol string
 	return totalVol
 }
 
-func (sa *ShardedAggregator) calculateCrossExchange(symbol string, exchanges map[string]*PriceState, ts time.Time, qVol decimal.Decimal) {
-	var minPrice, maxPrice decimal.Decimal
-	var minEx, maxEx string
+// calculateCrossExchange считает ИСПОЛНЯЕМЫЙ межбиржевой спред по bid/ask:
+// мы покупаем фьючерс на бирже с минимальным ask и продаём на бирже с
+// максимальным bid. Спред = (maxBid - minAsk) / minAsk.
+func (sa *ShardedAggregator) calculateCrossExchange(symbol string, exchanges map[string]*PriceState, ts time.Time, qVol decimal.Decimal) *domain.SpreadEvent {
+	var minAsk, maxBid decimal.Decimal
+	var buyEx, sellEx string
 	first := true
 
 	for ex, state := range exchanges {
-		if state.Futures.IsZero() {
+		if state.FuturesBid.IsZero() || state.FuturesAsk.IsZero() {
 			continue
 		}
 		if first {
-			minPrice, maxPrice = state.Futures, state.Futures
-			minEx, maxEx = ex, ex
+			minAsk, maxBid = state.FuturesAsk, state.FuturesBid
+			buyEx, sellEx = ex, ex
 			first = false
 			continue
 		}
-		if state.Futures.LessThan(minPrice) {
-			minPrice = state.Futures
-			minEx = ex
+		if state.FuturesAsk.LessThan(minAsk) {
+			minAsk = state.FuturesAsk
+			buyEx = ex
 		}
-		if state.Futures.GreaterThan(maxPrice) {
-			maxPrice = state.Futures
-			maxEx = ex
+		if state.FuturesBid.GreaterThan(maxBid) {
+			maxBid = state.FuturesBid
+			sellEx = ex
 		}
 	}
-	if first {
-		return
+	if first || minAsk.IsZero() {
+		return nil
 	}
 
-	spread := maxPrice.Sub(minPrice).Div(minPrice)
+	spread := maxBid.Sub(minAsk).Div(minAsk)
 
-	// Используем жесткий лимит разработчика, чтобы не пропустить сигнал ни для кого
 	if spread.GreaterThanOrEqual(sa.config.GetHardMinSpread()) {
-		if sa.funding.IsArbProfitable(symbol, spread, ts) {
-			sa.sendEventNonBlocking(domain.SpreadEvent{
+		if sa.funding.IsArbProfitable(symbol, spread, ts, buyEx, sellEx) {
+			return &domain.SpreadEvent{
 				Symbol: symbol, SpreadType: domain.CrossExchange, Spread: spread,
-				ExchangeA: minEx, ExchangeB: maxEx, QuoteVolume: qVol, Timestamp: ts,
-			})
+				ExchangeA: buyEx, ExchangeB: sellEx, QuoteVolume: qVol, Timestamp: ts,
+			}
 		}
 	}
+	return nil
 }
 
-func (sa *ShardedAggregator) calculateIntraExchange(symbol, exchange string, state *PriceState, ts time.Time, qVol decimal.Decimal) {
-	if state.Spot.IsZero() || state.Futures.IsZero() {
-		return
+// calculateIntraExchange считает ИСПОЛНЯЕМЫЙ внутрибиржевой спред (базис) по
+// bid/ask: берём положительный (арбитражируемый) вариант — либо продать
+// фьючерс/купить спот, либо продать спот/купить фьючерс.
+func (sa *ShardedAggregator) calculateIntraExchange(symbol, exchange string, state *PriceState, ts time.Time, qVol decimal.Decimal) *domain.SpreadEvent {
+	if state.SpotBid.IsZero() || state.SpotAsk.IsZero() || state.FuturesBid.IsZero() || state.FuturesAsk.IsZero() {
+		return nil
 	}
 
-	spread := state.Futures.Sub(state.Spot).Abs().Div(state.Spot)
+	// Продать фьючерс (по FuturesBid), купить спот (по SpotAsk).
+	spreadFutPremium := state.FuturesBid.Sub(state.SpotAsk).Div(state.SpotAsk)
+	// Продать спот (по SpotBid), купить фьючерс (по FuturesAsk).
+	spreadSpotPremium := state.SpotBid.Sub(state.FuturesAsk).Div(state.FuturesAsk)
+
+	spread := spreadFutPremium
+	if spreadSpotPremium.GreaterThan(spread) {
+		spread = spreadSpotPremium
+	}
+	if spread.IsNegative() {
+		return nil
+	}
 
 	if spread.GreaterThanOrEqual(sa.config.GetHardMinSpread()) {
-		if sa.funding.IsArbProfitable(symbol, spread, ts) {
-			sa.sendEventNonBlocking(domain.SpreadEvent{
+		if sa.funding.IsArbProfitable(symbol, spread, ts, exchange) {
+			return &domain.SpreadEvent{
 				Symbol: symbol, SpreadType: domain.IntraExchange, Spread: spread,
 				ExchangeA: exchange, ExchangeB: exchange, QuoteVolume: qVol, Timestamp: ts,
-			})
+			}
 		}
 	}
+	return nil
 }
 
-func (sa *ShardedAggregator) sendEventNonBlocking(event domain.SpreadEvent) {
-	select {
-	case sa.trackerChan <- event:
-	default:
-	}
+// sendEvent отправляет событие в трекер БЛОКИРУЮЩЕ: событие никогда не теряется
+// молча. Вызывается только ПОСЛЕ снятия мьютекса на shard.
+func (sa *ShardedAggregator) sendEvent(event *domain.SpreadEvent) {
+	sa.trackerChan <- *event
 }

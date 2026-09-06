@@ -75,8 +75,7 @@ func NewAdapter() *Adapter {
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listenSpot(ctx, out)
-	return nil
+	return a.connectSpot(ctx, out)
 }
 
 // ConnectFunding — GATEIO не предоставляет поток ставок финансирования через
@@ -90,46 +89,7 @@ func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) e
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listenFutures(ctx, out)
-	return nil
-}
-
-func (a *Adapter) listenSpot(ctx context.Context, out chan<- domain.MarketTick) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectSpot(ctx, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Gate.io Spot WS: %v — reconnecting", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
-}
-
-func (a *Adapter) listenFutures(ctx context.Context, out chan<- domain.MarketTick) {
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := a.connectFutures(ctx, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  Gate.io Futures WS: %v — reconnecting", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(reconnectDelay):
-		}
-	}
+	return a.connectFutures(ctx, out)
 }
 
 func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick) error {

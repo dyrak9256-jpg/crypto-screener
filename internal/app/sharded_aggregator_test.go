@@ -63,9 +63,11 @@ func TestShardedAggregator_ShardRouting(t *testing.T) {
 			require.NotNil(t, targetShard.prices[symbol]["BYBIT"], "target shard must have BYBIT prices")
 
 			// Check Spot mid price: (100 + 102) / 2 = 101
-			assert.True(t, targetShard.prices[symbol]["BINANCE"].Spot.Equal(decimal.RequireFromString("101")))
+			assert.True(t, targetShard.prices[symbol]["BINANCE"].SpotBid.Equal(decimal.RequireFromString("100")))
+			assert.True(t, targetShard.prices[symbol]["BINANCE"].SpotAsk.Equal(decimal.RequireFromString("102")))
 			// Check Futures mid price: (103 + 105) / 2 = 104
-			assert.True(t, targetShard.prices[symbol]["BYBIT"].Futures.Equal(decimal.RequireFromString("104")))
+			assert.True(t, targetShard.prices[symbol]["BYBIT"].FuturesBid.Equal(decimal.RequireFromString("103")))
+			assert.True(t, targetShard.prices[symbol]["BYBIT"].FuturesAsk.Equal(decimal.RequireFromString("105")))
 			targetShard.mu.Unlock()
 
 			// Check all OTHER shards to ensure no state leakage
@@ -143,8 +145,8 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 		assert.Equal(t, "KRAKEN", finalEvent.ExchangeA, "ExchangeA should be minimum exchange")
 		assert.Equal(t, "OKX", finalEvent.ExchangeB, "ExchangeB should be maximum exchange")
 
-		// Spread = (105 - 98) / 98
-		expectedSpread := decimal.RequireFromString("105").Sub(decimal.RequireFromString("98")).Div(decimal.RequireFromString("98"))
+		// Spread = (maxBid - minAsk) / minAsk = (104.9 - 98.1) / 98.1
+		expectedSpread := decimal.RequireFromString("104.9").Sub(decimal.RequireFromString("98.1")).Div(decimal.RequireFromString("98.1"))
 		assert.True(t, finalEvent.Spread.Equal(expectedSpread), "expected spread %s, got %s", expectedSpread, finalEvent.Spread)
 	})
 
@@ -214,7 +216,7 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 		now := time.Now()
 		symbol := "DOGEUSDT"
 
-		// Spot mid = 0.10
+		// Spot bid/ask = 0.10
 		sa.ProcessTick(domain.MarketTick{
 			Exchange:    "BINANCE",
 			Symbol:      symbol,
@@ -225,7 +227,7 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 			Timestamp:   now,
 		})
 
-		// Futures mid = 0.105 -> Intra spread = |0.105 - 0.10| / 0.10 = 0.05 (5%)
+		// Futures bid/ask = 0.105 -> executable intra spread = (0.105 - 0.10)/0.10 = 0.05 (5%)
 		sa.ProcessTick(domain.MarketTick{
 			Exchange:    "BINANCE",
 			Symbol:      symbol,
@@ -263,7 +265,7 @@ func TestShardedAggregator_MinMaxSpreadCalculation(t *testing.T) {
 		symbol := "XRPUSDT"
 
 		// Set funding rate higher than spread: rate = 10%
-		funding.UpdateFunding(symbol, decimal.RequireFromString("0.10"), now.Add(2*time.Hour))
+		funding.UpdateFunding("BINANCE", symbol, decimal.RequireFromString("0.10"), now.Add(2*time.Hour))
 
 		// Spread will be (103 - 100) / 100 = 3% < 10% funding
 		sa.ProcessTick(domain.MarketTick{
@@ -296,6 +298,7 @@ func TestShardedAggregator_VolumeBucketing(t *testing.T) {
 	funding := NewFundingManager(cfg)
 	trackerChan := make(chan domain.SpreadEvent, 100)
 	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	sa.staleWindow = 7 * 24 * time.Hour // historical fixtures are not "stale" here
 
 	t0 := time.Date(2026, 9, 5, 10, 0, 0, 0, time.UTC)
 	symbol := "BTCUSDT"
@@ -429,6 +432,7 @@ func TestShardedAggregator_VolumeTimeframes_And_EdgeCases(t *testing.T) {
 	funding := NewFundingManager(cfg)
 	trackerChan := make(chan domain.SpreadEvent, 100)
 	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	sa.staleWindow = 7 * 24 * time.Hour // historical fixtures are not "stale" here
 
 	t0 := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 
@@ -460,22 +464,21 @@ func TestShardedAggregator_VolumeTimeframes_And_EdgeCases(t *testing.T) {
 		assert.True(t, v.Equal(decimal.NewFromInt(500)), "expected volume 500 for timeframe %s, got %s", tf, v)
 	}
 
-	// 3. sendEventNonBlocking when trackerChan is full
+	// 3. sendEvent delivers without silent drop when a reader is present.
 	fullChan := make(chan domain.SpreadEvent, 1)
-	fullChan <- domain.SpreadEvent{Symbol: "DUMMY"}
 	saFull := NewShardedAggregator(fullChan, funding, cfg)
 
-	done := make(chan struct{})
+	delivered := make(chan domain.SpreadEvent, 1)
 	go func() {
-		saFull.sendEventNonBlocking(domain.SpreadEvent{Symbol: "DROPPED"})
-		close(done)
+		saFull.sendEvent(&domain.SpreadEvent{Symbol: "DELIVERED"})
+		delivered <- <-fullChan
 	}()
 
 	select {
-	case <-done:
-		// Succeeded without blocking
+	case got := <-delivered:
+		assert.Equal(t, "DELIVERED", got.Symbol)
 	case <-time.After(500 * time.Millisecond):
-		t.Fatal("sendEventNonBlocking blocked on full channel")
+		t.Fatal("sendEvent did not deliver event")
 	}
 
 	// 4. Intra-exchange with missing/zero prices
@@ -499,4 +502,99 @@ func TestShardedAggregator_VolumeTimeframes_And_EdgeCases(t *testing.T) {
 		QuoteVolume: decimal.NewFromInt(100), Timestamp: t0,
 	})
 	assert.Empty(t, trackerChan, "intra spread below hard limit should not emit event")
+}
+
+func TestShardedAggregator_BidAskValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.01"), decimal.RequireFromString("1000"))
+	funding := NewFundingManager(cfg)
+	trackerChan := make(chan domain.SpreadEvent, 100)
+	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	now := time.Now()
+
+	// Invalid: bid > ask.
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BINANCE", Symbol: "INVALID1", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("200"), BestAsk: decimal.RequireFromString("100"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: now,
+	})
+	// Invalid: non-positive bid/ask.
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BINANCE", Symbol: "INVALID2", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.Zero, BestAsk: decimal.RequireFromString("100"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: now,
+	})
+	assert.Empty(t, trackerChan, "invalid ticks must be rejected before any spread calc")
+
+	// Valid cross-exchange (BINANCE vs BYBIT futures) should emit an event.
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BINANCE", Symbol: "VALID", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("99.9"), BestAsk: decimal.RequireFromString("100.1"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: now,
+	})
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BYBIT", Symbol: "VALID", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("104.9"), BestAsk: decimal.RequireFromString("105.1"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: now,
+	})
+	assert.NotEmpty(t, trackerChan, "valid ticks must produce a cross-exchange event")
+}
+
+func TestShardedAggregator_StaleTicksExcluded(t *testing.T) {
+	t.Parallel()
+
+	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.01"), decimal.RequireFromString("1000"))
+	funding := NewFundingManager(cfg)
+	trackerChan := make(chan domain.SpreadEvent, 100)
+	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	now := time.Now()
+
+	// Stale timestamp (well beyond staleWindow) must be excluded.
+	stale := now.Add(-2 * staleWindow)
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BINANCE", Symbol: "STALE", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("99.9"), BestAsk: decimal.RequireFromString("100.1"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: stale,
+	})
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BYBIT", Symbol: "STALE", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("104.9"), BestAsk: decimal.RequireFromString("105.1"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: stale,
+	})
+	assert.Empty(t, trackerChan, "stale ticks must be excluded from arbitrage")
+}
+
+func TestShardedAggregator_PerExchangeFundingFilter(t *testing.T) {
+	t.Parallel()
+
+	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.01"), decimal.RequireFromString("1000"))
+	funding := NewFundingManager(cfg)
+	trackerChan := make(chan domain.SpreadEvent, 100)
+	sa := NewShardedAggregator(trackerChan, funding, cfg)
+	now := time.Now()
+
+	// Funding on an UNRELATED exchange (OKX) with an enormous rate must NOT
+	// suppress the cross-exchange signal between BINANCE and BYBIT.
+	funding.UpdateFunding("OKX", "BTCUSDT", decimal.RequireFromString("0.5"), now.Add(2*time.Hour))
+
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("99.9"), BestAsk: decimal.RequireFromString("100.1"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: now,
+	})
+	sa.ProcessTick(domain.MarketTick{
+		Exchange: "BYBIT", Symbol: "BTCUSDT", MarketType: domain.MarketTypeFutures,
+		BestBid: decimal.RequireFromString("104.9"), BestAsk: decimal.RequireFromString("105.1"),
+		QuoteVolume: decimal.NewFromInt(1000), Timestamp: now,
+	})
+
+	found := false
+	for len(trackerChan) > 0 {
+		ev := <-trackerChan
+		if ev.SpreadType == domain.CrossExchange {
+			found = true
+		}
+	}
+	assert.True(t, found, "cross-exchange signal must NOT be suppressed by funding on an unrelated exchange")
 }

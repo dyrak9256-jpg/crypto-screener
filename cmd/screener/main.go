@@ -74,5 +74,7 @@ func main() {
 
 	// Детерминированное завершение: останавливаем биржевые коннекторы.
 	cm.StopAll()
+	// Корректно останавливаем Telegram-бота (дочитывает очередь, без send-on-closed).
+	tgBot.Close()
 	log.Println("✅ Engine stopped cleanly.")
 }

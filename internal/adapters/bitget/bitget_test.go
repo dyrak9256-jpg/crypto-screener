@@ -8,7 +8,6 @@ import (
 	"crypto-screener/internal/domain"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // Connect* методы после H1-фикса БЛОКИРУЮТСЯ на время жизни соединения.
@@ -28,7 +27,7 @@ func TestBitget_ConnectMethods_ReturnPromptlyOnCanceledContext(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		select {
 		case err := <-done:
-			require.NoError(t, err)
+			_ = err // prompt return is the contract; a cancelled-ctx dial error is expected
 		case <-time.After(2 * time.Second):
 			t.Fatalf("Connect* did not return promptly on cancelled context")
 		}
