@@ -45,14 +45,14 @@ crypto-screener/
 ```
 
 ## Поток данных
-1. **Ingestion:** каждый адаптер биржи через WebSocket (`internal/adapters/*`) парсит тики и шлёт `MarketTick` в `tickChan`.
-2. **Обработка:** пул ingestion-воркеров (`app.go`) → `ShardedAggregator.ProcessTick`.
-3. **Математика:** агрегатор обновляет состояние шарда, считает Min/Max спред (cross/intra), проверяет funding (`FundingManager`) и шлёт `SpreadEvent` в `trackerChan`.
-4. **Трекинг:** `Tracker` открывает/обновляет/закрывает сигнал и шлёт его в `dbChan` и `NotificationRouter`.
+1. **Ingestion:** каждый адаптер биржи через WebSocket (`internal/adapters/*`) открывает **одно** соединение, парсит тики и шлёт `MarketTick` в `tickChan`; переподключение выполняет только `ConnectorManager.runWithReconnect`.
+2. **Обработка:** пул ingestion-воркеров (`app.go`) → `ShardedAggregator.ProcessTick` (валидация bid/ask + отсев устаревших).
+3. **Математика:** агрегатор обновляет состояние шарда, считает исполняемый спред по bid/ask (cross/intra), проверяет funding по вовлечённым биржам (`FundingManager`) и шлёт `SpreadEvent` в `trackerChan`.
+4. **Трекинг:** `Tracker` открывает/обновляет/закрывает сигнал и шлёт его в `dbChan` (блокирующе, без потерь) и `NotificationRouter` (отслеживаемая горутина).
 5. **Маршрутизация и сохранение:** `NotificationRouter` фильтрует по настройкам пользователей → Telegram; `PersistenceWorker` пишет сигналы в PostgreSQL.
 
 ## Горячая смена коннекторов
 `/addex`/`/rmex` (только для админов) через `ConnectorManager` добавляет/удаляет биржу на лету, останавливая старый коннектор и запуская новый без перезапуска приложения.
 
 ## Завершение работы
-`Application.Run` при отмене контекста останавливает воркеров, закрывает `dbChan`, дожидается drain в БД; `ConnectorManager.StopAll` корректно завершает все биржевые соединения.
+`Application.Run` при отмене контекста выполняет детерминированную цепочку: останавливает приём тиков (`ingestWg`) → закрывает `trackerChan` и ждёт трекер → ждёт горутины уведомлений (`routerWg`) → закрывает `dbChan` → дожидается drain в БД (`persistWg`). Затем `ConnectorManager.StopAll` завершает все биржевые соединения, а `tgBot.Close()` корректно останавливает Telegram-бота (без `send on closed channel`).
