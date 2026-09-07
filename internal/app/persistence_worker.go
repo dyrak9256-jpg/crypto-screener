@@ -24,15 +24,30 @@ func NewPersistenceWorker(dbChan chan *domain.ArbitrageSignal, repo domain.Signa
 
 func (w *PersistenceWorker) Start(shutdown context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println("💾 Persistence worker started")
-	for signal := range w.dbChan {
-		if signal == nil || w.signalRepo == nil {
-			continue
-		}
-		if err := w.persist(shutdown, signal); err != nil {
-			log.Printf("❌ Failed to persist signal %s after retries: %v", signal.ID, err)
-		}
+	if shutdown == nil {
+		shutdown = context.Background()
 	}
+	if w.dbChan == nil || w.signalRepo == nil {
+		log.Println("💾 Persistence worker stopped: queue or repository is nil")
+		return
+	}
+	const workerCount = 4
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workers.Done()
+			for signal := range w.dbChan {
+				if signal == nil {
+					continue
+				}
+				if err := w.persist(shutdown, signal); err != nil {
+					log.Printf("❌ Failed to persist signal %s after retries: %v", signal.ID, err)
+				}
+			}
+		}()
+	}
+	workers.Wait()
 	log.Println("💾 Persistence worker stopped")
 }
 
@@ -48,6 +63,7 @@ func (w *PersistenceWorker) persist(shutdown context.Context, signal *domain.Arb
 		if err == nil {
 			return nil
 		}
+		lastErr := fmt.Errorf("save signal %s: %w", signal.ID, err)
 
 		timer := time.NewTimer(backoff)
 		select {
@@ -59,7 +75,7 @@ func (w *PersistenceWorker) persist(shutdown context.Context, signal *domain.Arb
 				default:
 				}
 			}
-			return shutdown.Err()
+			return fmt.Errorf("persist signal %s interrupted after database error: %w: %v", signal.ID, shutdown.Err(), lastErr)
 		}
 		if backoff < 5*time.Second {
 			backoff *= 2

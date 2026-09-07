@@ -243,3 +243,34 @@ func TestPostgresRepository_Signals_Upsert(t *testing.T) {
 	assert.Equal(t, int64(45000), dbDurationMs, "duration_ms should match 45000 ms")
 	assert.True(t, closedAt.Equal(dbClosedAt), "closed_at should match event time")
 }
+
+func TestPostgresRepository_ReconcileActiveSignals(t *testing.T) {
+	repo, cleanup := setupTestPostgres(t)
+	if repo == nil {
+		return
+	}
+	defer cleanup()
+
+	ctx := context.Background()
+	signal := &domain.ArbitrageSignal{
+		ID:            uuid.NewString(),
+		Symbol:        "BTCUSDT",
+		SpreadType:    domain.CrossExchange,
+		ExchangeA:     "BINANCE",
+		ExchangeB:     "BYBIT",
+		OpenedAt:      time.Now().Add(-2 * time.Minute),
+		IsActive:      true,
+		InitialSpread: decimal.RequireFromString("0.02"),
+		PeakSpread:    decimal.RequireFromString("0.03"),
+	}
+	require.NoError(t, repo.SaveSignal(ctx, signal))
+	require.NoError(t, repo.ReconcileActiveSignals(ctx))
+
+	var active bool
+	var final *string
+	var duration int64
+	require.NoError(t, repo.pool.QueryRow(ctx, `SELECT is_active, final_spread, duration_ms FROM signals WHERE id = $1`, signal.ID).Scan(&active, &final, &duration))
+	assert.False(t, active)
+	assert.Nil(t, final)
+	assert.Greater(t, duration, int64(0))
+}

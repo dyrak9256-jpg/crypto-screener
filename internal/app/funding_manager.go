@@ -2,6 +2,8 @@ package app
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,24 +16,11 @@ type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
 
-type ArbDirection int8
-
-const (
-	DirectionUnknown ArbDirection = iota
-	SpotLongFuturesShort
-	SpotShortFuturesLong
-)
-
-func (d ArbDirection) Valid() bool { return d == SpotLongFuturesShort || d == SpotShortFuturesLong }
-
 type ArbReason string
 
 const (
 	ReasonProfitable               ArbReason = "PROFITABLE"
 	ReasonBelowMinSpread           ArbReason = "BELOW_MIN_SPREAD"
-	ReasonHazardWindow             ArbReason = "HAZARD_WINDOW"
-	ReasonGracePeriod              ArbReason = "GRACE_PERIOD"
-	ReasonWindowUnknown            ArbReason = "WINDOW_UNKNOWN"
 	ReasonDataStale                ArbReason = "DATA_STALE"
 	ReasonNoData                   ArbReason = "NO_DATA"
 	ReasonStreamUnhealthy          ArbReason = "STREAM_UNHEALTHY"
@@ -40,41 +29,28 @@ const (
 )
 
 type FundingConfig struct {
-	MinSpread              decimal.Decimal
-	MaxDataStaleness       time.Duration
-	PreFundingHazardWindow time.Duration
-	PostFundingGracePeriod time.Duration
-	RequireFunding         bool
+	MinSpread        decimal.Decimal
+	MaxDataStaleness time.Duration
 }
 
 func DefaultFundingConfig() FundingConfig {
-	return FundingConfig{MinSpread: decimal.Zero, MaxDataStaleness: 15 * time.Second, PreFundingHazardWindow: 5 * time.Minute, PostFundingGracePeriod: time.Minute, RequireFunding: false}
+	return FundingConfig{MaxDataStaleness: 60 * time.Second}
 }
+
 func (c FundingConfig) normalize() FundingConfig {
 	d := DefaultFundingConfig()
 	if c.MaxDataStaleness == 0 {
 		c.MaxDataStaleness = d.MaxDataStaleness
 	}
-	if c.PreFundingHazardWindow == 0 {
-		c.PreFundingHazardWindow = d.PreFundingHazardWindow
-	}
-	if c.PostFundingGracePeriod == 0 {
-		c.PostFundingGracePeriod = d.PostFundingGracePeriod
-	}
 	return c
 }
+
 func (c FundingConfig) Validate() error {
 	if c.MinSpread.IsNegative() {
-		return errors.New("MinSpread cannot be negative")
+		return errors.New("min spread cannot be negative")
 	}
 	if c.MaxDataStaleness <= 0 {
-		return errors.New("MaxDataStaleness must be positive")
-	}
-	if c.PreFundingHazardWindow < 0 {
-		return errors.New("PreFundingHazardWindow cannot be negative")
-	}
-	if c.PostFundingGracePeriod < 0 {
-		return errors.New("PostFundingGracePeriod cannot be negative")
+		return errors.New("max data staleness must be positive")
 	}
 	return nil
 }
@@ -89,18 +65,20 @@ func (r FundingRecord) IsStale(now time.Time, max time.Duration) bool {
 	if r.LocalReceivedAt.IsZero() || max <= 0 {
 		return true
 	}
-	if now.Before(r.LocalReceivedAt) {
-		return r.LocalReceivedAt.Sub(now) > time.Second
-	}
-	return now.Sub(r.LocalReceivedAt) > max
+	age := now.Sub(r.LocalReceivedAt)
+	return age < 0 || age > max
 }
 
 type ArbResult struct {
-	Profitable      bool
-	Reason          ArbReason
-	NetSpread       decimal.Decimal
-	FundingRate     decimal.Decimal
-	NextFundingTime time.Time
+	Profitable          bool
+	Reason              ArbReason
+	NetSpread           decimal.Decimal
+	FundingRate         decimal.Decimal
+	NextFundingTime     time.Time
+	BuyFundingRate      decimal.Decimal
+	SellFundingRate     decimal.Decimal
+	BuyNextFundingTime  time.Time
+	SellNextFundingTime time.Time
 }
 
 type fundingKey struct{ Exchange, Symbol string }
@@ -116,7 +94,7 @@ type FundingManager struct {
 func NewFundingManager(cfg FundingConfig, clock Clock) (*FundingManager, error) {
 	cfg = cfg.normalize()
 	if err := cfg.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("validate funding config: %w", err)
 	}
 	if clock == nil {
 		clock = realClock{}
@@ -125,54 +103,71 @@ func NewFundingManager(cfg FundingConfig, clock Clock) (*FundingManager, error) 
 	fm.config.Store(&cfg)
 	return fm, nil
 }
+
 func (fm *FundingManager) UpdateConfig(cfg FundingConfig) error {
 	cfg = cfg.normalize()
 	if err := cfg.Validate(); err != nil {
-		return err
+		return fmt.Errorf("validate funding config: %w", err)
 	}
 	fm.config.Store(&cfg)
 	return nil
 }
+
 func (fm *FundingManager) SetStreamHealth(exchange string, healthy bool) {
 	fm.SetExchangeStreamHealth(exchange, healthy)
 }
+
 func (fm *FundingManager) SetExchangeStreamHealth(exchange string, healthy bool) {
+	exchange = strings.ToUpper(strings.TrimSpace(exchange))
+	if exchange == "" {
+		return
+	}
 	v := new(atomic.Bool)
 	if old, ok := fm.health.LoadOrStore(exchange, v); ok {
 		v = old.(*atomic.Bool)
 	}
 	v.Store(healthy)
 }
+
 func (fm *FundingManager) isHealthy(exchange string) bool {
-	if v, ok := fm.health.Load(exchange); ok {
-		return v.(*atomic.Bool).Load()
+	v, ok := fm.health.Load(strings.ToUpper(strings.TrimSpace(exchange)))
+	if !ok {
+		return false
 	}
-	if v, ok := fm.health.Load("*"); ok {
-		return v.(*atomic.Bool).Load()
-	}
-	return false
+	return v.(*atomic.Bool).Load()
 }
-func (fm *FundingManager) UpdateFunding(exchange, symbol string, rate decimal.Decimal, nextFundingTime, eventTime time.Time) error {
-	if exchange == "" || symbol == "" {
+
+func normalizeFundingKey(exchange, symbol string) fundingKey {
+	return fundingKey{
+		Exchange: strings.ToUpper(strings.TrimSpace(exchange)),
+		Symbol:   strings.ToUpper(strings.NewReplacer("-", "", "_", "", "/", "").Replace(strings.TrimSpace(symbol))),
+	}
+}
+
+func (fm *FundingManager) UpdateFunding(exchange, symbol string, rate decimal.Decimal, next, event time.Time) error {
+	key := normalizeFundingKey(exchange, symbol)
+	if key.Exchange == "" || key.Symbol == "" {
 		return errors.New("exchange and symbol must not be empty")
 	}
 	now := fm.clock.Now()
-	key := fundingKey{Exchange: exchange, Symbol: symbol}
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
-	if old, ok := fm.rates[key]; ok && !eventTime.IsZero() && !old.EventTime.IsZero() && eventTime.Before(old.EventTime) {
+	if old, ok := fm.rates[key]; ok && !event.IsZero() && !old.EventTime.IsZero() && event.Before(old.EventTime) {
 		return nil
 	}
-	fm.rates[key] = FundingRecord{Exchange: exchange, Symbol: symbol, Rate: rate, NextFundingTime: nextFundingTime, EventTime: eventTime, LocalReceivedAt: now}
-	fm.SetExchangeStreamHealth(exchange, true)
+	fm.rates[key] = FundingRecord{Exchange: key.Exchange, Symbol: key.Symbol, Rate: rate, NextFundingTime: next, EventTime: event, LocalReceivedAt: now}
+	fm.SetExchangeStreamHealth(key.Exchange, true)
 	return nil
 }
+
 func (fm *FundingManager) GetFunding(exchange, symbol string) (FundingRecord, bool) {
+	key := normalizeFundingKey(exchange, symbol)
 	fm.mu.RLock()
-	r, ok := fm.rates[fundingKey{exchange, symbol}]
+	r, ok := fm.rates[key]
 	fm.mu.RUnlock()
 	return r, ok
 }
+
 func (fm *FundingManager) EvictStale() {
 	p := fm.config.Load()
 	if p == nil {
@@ -187,68 +182,106 @@ func (fm *FundingManager) EvictStale() {
 	}
 	fm.mu.Unlock()
 }
-func CalcNetSpread(spread, rate decimal.Decimal, direction ArbDirection) (decimal.Decimal, error) {
-	switch direction {
-	case SpotLongFuturesShort:
-		return spread.Add(rate), nil
-	case SpotShortFuturesLong:
-		return spread.Sub(rate), nil
-	default:
-		return decimal.Zero, errors.New("invalid arb direction")
-	}
+
+// CalcNetSpread applies funding according to the actual position directions:
+// buy futures pays/receives buyRate, while a short futures leg contributes
+// sellRate. For SPOT/FUTURES the spot leg is deliberately represented by zero.
+func CalcNetSpread(spread, buyRate, sellRate decimal.Decimal) decimal.Decimal {
+	return spread.Add(sellRate).Sub(buyRate)
 }
-func (fm *FundingManager) EvaluateArb(exchange, symbol string, spread decimal.Decimal, direction ArbDirection, now time.Time) ArbResult {
-	if now.IsZero() || exchange == "" || symbol == "" || !direction.Valid() {
+
+func (fm *FundingManager) EvaluateSpotFutures(exchange, symbol string, spread decimal.Decimal, now time.Time) ArbResult {
+	if now.IsZero() || exchange == "" || symbol == "" || spread.IsNegative() {
 		return ArbResult{Reason: ReasonInvalidInput}
 	}
 	p := fm.config.Load()
 	if p == nil {
 		return ArbResult{Reason: ReasonConfigurationUnavailable}
 	}
-	rec, ok := fm.GetFunding(exchange, symbol)
+	// SPOT BUY has no funding. FUTURES SHORT is the sell leg and therefore its
+	// funding rate is added to the executable spread.
+	sell, ok := fm.validRecord(exchange, symbol, now, *p)
 	if !ok {
-		if p.RequireFunding {
-			return ArbResult{Reason: ReasonNoData}
-		}
-		return ArbResult{Profitable: true, Reason: ReasonProfitable, NetSpread: spread}
+		return sell
 	}
-	if !fm.isHealthy(exchange) {
-		if p.RequireFunding {
-			return ArbResult{Reason: ReasonStreamUnhealthy}
-		}
-		return ArbResult{Profitable: true, Reason: ReasonProfitable, NetSpread: spread}
-	}
-	if rec.IsStale(now, p.MaxDataStaleness) {
-		if p.RequireFunding {
-			return ArbResult{Reason: ReasonDataStale, FundingRate: rec.Rate, NextFundingTime: rec.NextFundingTime}
-		}
-		return ArbResult{Profitable: true, Reason: ReasonProfitable, NetSpread: spread}
-	}
-	net, err := CalcNetSpread(spread, rec.Rate, direction)
-	if err != nil {
-		return ArbResult{Reason: ReasonInvalidInput}
-	}
-	reason := evaluateWindow(now, rec.NextFundingTime, *p)
-	if reason != ReasonProfitable {
-		return ArbResult{Reason: reason, NetSpread: net, FundingRate: rec.Rate, NextFundingTime: rec.NextFundingTime}
+	net := CalcNetSpread(spread, decimal.Zero, sell.FundingRate)
+	result := ArbResult{
+		NetSpread:           net,
+		FundingRate:         sell.FundingRate,
+		NextFundingTime:     sell.NextFundingTime,
+		BuyFundingRate:      decimal.Zero,
+		SellFundingRate:     sell.FundingRate,
+		BuyNextFundingTime:  time.Time{},
+		SellNextFundingTime: sell.NextFundingTime,
 	}
 	if net.LessThan(p.MinSpread) {
-		return ArbResult{Reason: ReasonBelowMinSpread, NetSpread: net, FundingRate: rec.Rate, NextFundingTime: rec.NextFundingTime}
+		result.Reason = ReasonBelowMinSpread
+		return result
 	}
-	return ArbResult{Profitable: true, Reason: ReasonProfitable, NetSpread: net, FundingRate: rec.Rate, NextFundingTime: rec.NextFundingTime}
+	result.Profitable = true
+	result.Reason = ReasonProfitable
+	return result
 }
-func evaluateWindow(now, next time.Time, c FundingConfig) ArbReason {
-	if next.IsZero() {
-		return ReasonWindowUnknown
+
+func (fm *FundingManager) EvaluateFuturesPair(buyEx, buySymbol, sellEx, sellSymbol string, spread decimal.Decimal, now time.Time) ArbResult {
+	if now.IsZero() || buyEx == "" || buySymbol == "" || sellEx == "" || sellSymbol == "" || spread.IsNegative() {
+		return ArbResult{Reason: ReasonInvalidInput}
 	}
-	if now.Before(next) {
-		if next.Sub(now) <= c.PreFundingHazardWindow {
-			return ReasonHazardWindow
-		}
-		return ReasonProfitable
+	p := fm.config.Load()
+	if p == nil {
+		return ArbResult{Reason: ReasonConfigurationUnavailable}
 	}
-	if now.Sub(next) <= c.PostFundingGracePeriod {
-		return ReasonGracePeriod
+	buy, ok := fm.validRecord(buyEx, buySymbol, now, *p)
+	if !ok {
+		return buy
 	}
-	return ReasonWindowUnknown
+	sell, ok := fm.validRecord(sellEx, sellSymbol, now, *p)
+	if !ok {
+		return sell
+	}
+	net := CalcNetSpread(spread, buy.FundingRate, sell.FundingRate)
+	next := earliestFunding(buy.NextFundingTime, sell.NextFundingTime)
+	result := ArbResult{
+		NetSpread:           net,
+		FundingRate:         buy.FundingRate,
+		NextFundingTime:     next,
+		BuyFundingRate:      buy.FundingRate,
+		SellFundingRate:     sell.FundingRate,
+		BuyNextFundingTime:  buy.NextFundingTime,
+		SellNextFundingTime: sell.NextFundingTime,
+	}
+	if net.LessThan(p.MinSpread) {
+		result.Reason = ReasonBelowMinSpread
+		return result
+	}
+	result.Profitable = true
+	result.Reason = ReasonProfitable
+	return result
+}
+
+func (fm *FundingManager) validRecord(exchange, symbol string, now time.Time, cfg FundingConfig) (ArbResult, bool) {
+	r, ok := fm.GetFunding(exchange, symbol)
+	if !ok {
+		return ArbResult{Reason: ReasonNoData}, false
+	}
+	if !fm.isHealthy(exchange) {
+		return ArbResult{Reason: ReasonStreamUnhealthy}, false
+	}
+	if r.NextFundingTime.IsZero() {
+		return ArbResult{Reason: ReasonNoData}, false
+	}
+	if r.IsStale(now, cfg.MaxDataStaleness) {
+		return ArbResult{Reason: ReasonDataStale, BuyFundingRate: r.Rate, SellFundingRate: r.Rate, BuyNextFundingTime: r.NextFundingTime, SellNextFundingTime: r.NextFundingTime}, false
+	}
+	return ArbResult{Profitable: true, Reason: ReasonProfitable, FundingRate: r.Rate, NextFundingTime: r.NextFundingTime}, true
+}
+
+func earliestFunding(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() || a.Before(b) {
+		return a
+	}
+	return b
 }

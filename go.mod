@@ -1,6 +1,6 @@
 module crypto-screener
 
-go 1.26
+go 1.26.4
 
 require (
 	github.com/bytedance/sonic v1.15.3

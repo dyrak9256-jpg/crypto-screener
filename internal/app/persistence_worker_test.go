@@ -9,7 +9,6 @@ import (
 	"crypto-screener/internal/domain"
 	"crypto-screener/internal/domain/mocks"
 	"github.com/google/uuid"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
 

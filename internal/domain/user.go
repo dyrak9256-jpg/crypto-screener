@@ -70,6 +70,13 @@ func (um *UserManager) Range(fn func(User) bool) {
 		}
 	}
 }
+func (um *UserManager) HasUsers() bool {
+	um.mu.RLock()
+	n := len(um.users)
+	um.mu.RUnlock()
+	return n > 0
+}
+
 func (um *UserManager) GetAllUsers() []*User {
 	um.mu.RLock()
 	list := make([]*User, 0, len(um.users))

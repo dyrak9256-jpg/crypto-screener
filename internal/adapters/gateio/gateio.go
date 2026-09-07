@@ -3,6 +3,10 @@ package gateio
 import (
 	"context"
 	"crypto-screener/internal/domain"
+	"crypto-screener/internal/ingress"
+	"crypto-screener/internal/retry"
+	"crypto-screener/internal/wsutil"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +36,7 @@ const (
 
 var (
 	dialer         = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+	httpClient     = &http.Client{Timeout: 10 * time.Second}
 	symbolReplacer = strings.NewReplacer("_", "", "-", "")
 )
 
@@ -66,22 +71,79 @@ type tickerData struct {
 // Gate.io Futures ticker fields
 // Поля подтверждены документацией Gate.io Futures WS V4
 type futuresTickerData struct {
-	Contract string `json:"contract"`          // "BTC_USDT"
-	Bid1     string `json:"highest_bid"`       // highest bid price
-	Ask1     string `json:"lowest_ask"`        // lowest ask price
-	Volume   string `json:"volume_24h_settle"` // ✅ объём в USDT (расчётная валюта)
+	Contract string `json:"contract"`         // "BTC_USDT"
+	Bid1     string `json:"highest_bid"`      // highest bid price
+	Ask1     string `json:"lowest_ask"`       // lowest ask price
+	Volume   string `json:"volume_24h_quote"` // quote-currency turnover
 }
 
 type Adapter struct {
 	droppedTicks    atomic.Uint64
 	symbolsMu       sync.Mutex
+	fundingSink     domain.FundingSink
 	spotSymbols     []string
 	futuresSymbols  []string
 	symbolsLoadedAt time.Time
 }
 
-func NewAdapter() *Adapter {
-	return &Adapter{}
+func NewAdapter() *Adapter { return &Adapter{} }
+func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
+	if sink == nil {
+		return fmt.Errorf("Gate funding sink is nil")
+	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := a.pollFunding(ctx, sink); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️ Gate funding poll: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+type gateFundingContract struct {
+	Name             string `json:"name"`
+	FundingRate      string `json:"funding_rate"`
+	FundingNextApply int64  `json:"funding_next_apply"`
+	Status           string `json:"status"`
+}
+
+func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, futuresSymbolsURL, nil)
+	if err != nil {
+		return fmt.Errorf("pollFunding: %w", err)
+	}
+	r, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("pollFunding: %w", err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %s", r.Status)
+	}
+	var rows []gateFundingContract
+	if err := json.NewDecoder(r.Body).Decode(&rows); err != nil {
+		return fmt.Errorf("pollFunding: %w", err)
+	}
+	now := time.Now()
+	for _, row := range rows {
+		if row.Status != "trading" {
+			continue
+		}
+		rate, err := decimal.NewFromString(row.FundingRate)
+		if err != nil {
+			continue
+		}
+		symbol := strings.ReplaceAll(row.Name, "_", "")
+		if err := sink.UpdateFunding("GATEIO", symbol, rate, time.Unix(row.FundingNextApply, 0), now); err != nil {
+			return fmt.Errorf("update GateIO funding %s: %w", symbol, err)
+		}
+	}
+	return nil
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
@@ -95,6 +157,7 @@ func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTi
 }
 
 func (a *Adapter) listenSpot(ctx context.Context, out chan<- domain.MarketTick) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -105,15 +168,14 @@ func (a *Adapter) listenSpot(ctx context.Context, out chan<- domain.MarketTick) 
 			}
 			log.Printf("⚠️  Gate.io Spot WS: %v — reconnecting", err)
 		}
-		select {
-		case <-ctx.Done():
+		if !backoff.Wait(ctx.Done()) {
 			return
-		case <-time.After(reconnectDelay):
 		}
 	}
 }
 
 func (a *Adapter) listenFutures(ctx context.Context, out chan<- domain.MarketTick) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -124,10 +186,8 @@ func (a *Adapter) listenFutures(ctx context.Context, out chan<- domain.MarketTic
 			}
 			log.Printf("⚠️  Gate.io Futures WS: %v — reconnecting", err)
 		}
-		select {
-		case <-ctx.Done():
+		if !backoff.Wait(ctx.Done()) {
 			return
-		case <-time.After(reconnectDelay):
 		}
 	}
 }
@@ -176,7 +236,9 @@ func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick)
 			}
 			return fmt.Errorf("read: %w", err)
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+			return fmt.Errorf("refresh GateIO read deadline: %w", err)
+		}
 
 		var resp spotWsResponse
 		if err := sonic.Unmarshal(msg, &resp); err != nil {
@@ -199,15 +261,7 @@ func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick)
 			if !ok {
 				continue
 			}
-			select {
-			case out <- tick:
-			case <-connCtx.Done():
-				return nil
-			default:
-				if n := a.droppedTicks.Add(1); n%1000 == 0 {
-					log.Printf("⚠️  Gate.io Spot: dropped %d ticks (channel full)", n)
-				}
-			}
+			ingress.Submit(out, tick)
 		}
 	}
 }
@@ -256,7 +310,9 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 			}
 			return fmt.Errorf("read futures: %w", err)
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+			return fmt.Errorf("refresh GateIO read deadline: %w", err)
+		}
 
 		var resp futuresWsResponse
 		if err := sonic.Unmarshal(msg, &resp); err != nil {
@@ -278,15 +334,7 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 			if !ok {
 				continue
 			}
-			select {
-			case out <- tick:
-			case <-connCtx.Done():
-				return nil
-			default:
-				if n := a.droppedTicks.Add(1); n%1000 == 0 {
-					log.Printf("⚠️  Gate.io Futures: dropped %d ticks (channel full)", n)
-				}
-			}
+			ingress.Submit(out, tick)
 		}
 	}
 }
@@ -315,7 +363,7 @@ func spotTickerToTick(d *tickerData, ts time.Time) (domain.MarketTick, bool) {
 		BestAsk:     ask,
 		QuoteVolume: qVol,
 		EventTime:   ts,
-		ReceivedAt:  ts,
+		ReceivedAt:  time.Now(),
 		Timestamp:   ts,
 	}, true
 }
@@ -344,7 +392,7 @@ func futuresTickerToTick(d *futuresTickerData, ts time.Time) (domain.MarketTick,
 		BestAsk:     ask,
 		QuoteVolume: qVol,
 		EventTime:   ts,
-		ReceivedAt:  ts,
+		ReceivedAt:  time.Now(),
 		Timestamp:   ts,
 	}, true
 }
@@ -364,7 +412,7 @@ func gateKeepAlive(ctx context.Context, conn *websocket.Conn, pingChannel string
 				Event:   "ping",
 			}
 			if err := conn.WriteJSON(ping); err != nil {
-				log.Printf("⚠️  Gate.io ping error [%s]: %v", pingChannel, err)
+				log.Printf("⚠️  %v", fmt.Errorf("GateIO %s keepalive: %w", pingChannel, err))
 				return
 			}
 		}
@@ -393,11 +441,11 @@ func (a *Adapter) getSymbols(ctx context.Context, spot bool) ([]string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getSymbols: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getSymbols: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -405,7 +453,7 @@ func (a *Adapter) getSymbols(ctx context.Context, spot bool) ([]string, error) {
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("getSymbols: %w", err)
 	}
 	var symbols []string
 	if spot {
@@ -415,7 +463,7 @@ func (a *Adapter) getSymbols(ctx context.Context, spot bool) ([]string, error) {
 			TradeStatus string `json:"trade_status"`
 		}
 		if err := sonic.Unmarshal(body, &rows); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("getSymbols: %w", err)
 		}
 		for _, row := range rows {
 			if row.Quote == "USDT" && (row.TradeStatus == "tradable" || row.TradeStatus == "trading" || row.TradeStatus == "") {
@@ -430,7 +478,7 @@ func (a *Adapter) getSymbols(ctx context.Context, spot bool) ([]string, error) {
 			Status      string `json:"status"`
 		}
 		if err := sonic.Unmarshal(body, &rows); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("getSymbols: %w", err)
 		}
 		for _, row := range rows {
 			if row.Type == "direct" && !row.InDelisting && (row.Status == "open" || row.Status == "trading" || row.Status == "") {
@@ -458,15 +506,22 @@ func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) er
 }
 
 type gateCandleResponse struct {
-	Channel string `json:"channel"`
-	Event   string `json:"event"`
-	Result  []struct {
-		T int64  `json:"t"`
-		N string `json:"n"`
-		A string `json:"a"`
-		W bool   `json:"w"`
-	} `json:"result"`
-	TimeMS int64 `json:"time_ms"`
+	Channel string          `json:"channel"`
+	Event   string          `json:"event"`
+	Result  json.RawMessage `json:"result"`
+	TimeMS  int64           `json:"time_ms"`
+}
+type gateSpotCandle struct {
+	T int64  `json:"t"`
+	N string `json:"n"`
+	V string `json:"v"`
+	W bool   `json:"w"`
+}
+type gateFuturesCandle struct {
+	T int64  `json:"t"`
+	N string `json:"n"`
+	A string `json:"a"`
+	V string `json:"v"`
 }
 
 func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, spot bool) {
@@ -478,6 +533,7 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, spo
 		channel = "futures.candlesticks"
 		market = domain.MarketTypeFutures
 	}
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for ctx.Err() == nil {
 		symbols, err := a.getSymbols(ctx, spot)
 		if err != nil {
@@ -485,12 +541,15 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, spo
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(reconnectDelay):
+			case <-retry.After(reconnectDelay):
 			}
 			continue
 		}
 		if err := a.readCandleShard(ctx, sink, url, channel, symbols, market); err != nil && ctx.Err() == nil {
 			log.Printf("⚠️ Gate %s candle WS: %v", market, err)
+		}
+		if ctx.Err() == nil && !backoff.Wait(ctx.Done()) {
+			return
 		}
 	}
 }
@@ -498,14 +557,19 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, spo
 func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, url, channel string, symbols []string, market domain.MarketType) error {
 	conn, _, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("readCandleShard: %w", err)
 	}
 	defer conn.Close()
 	conn.SetReadLimit(1 << 20)
-	go closeOnCtx(ctx, conn)
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := wsutil.StartHeartbeat(connCtx, conn, 20*time.Second, 60*time.Second); err != nil {
+		return fmt.Errorf("start websocket heartbeat: %w", err)
+	}
+	go closeOnCtx(connCtx, conn)
 	for _, sym := range symbols {
 		if err := conn.WriteJSON(wsRequest{Time: time.Now().Unix(), Channel: channel, Event: "subscribe", Payload: []string{"1m", sym}}); err != nil {
-			return err
+			return fmt.Errorf("readCandleShard: %w", err)
 		}
 	}
 	for {
@@ -514,27 +578,65 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, u
 			if ctx.Err() != nil {
 				return nil
 			}
-			return err
+			return fmt.Errorf("readCandleShard: %w", err)
+		}
+		if err := wsutil.TouchReadDeadline(conn, 60*time.Second); err != nil {
+			return fmt.Errorf("refresh websocket read deadline: %w", err)
 		}
 		var r gateCandleResponse
-		if sonic.Unmarshal(msg, &r) != nil || r.Event != "update" || r.Channel != channel {
+		if err := sonic.Unmarshal(msg, &r); err != nil {
 			continue
 		}
-		for _, d := range r.Result {
-			v, err := decimal.NewFromString(d.A)
-			if err != nil || !v.IsPositive() {
+		if r.Event == "error" {
+			return fmt.Errorf("GateIO candle subscription rejected on %s: %s", channel, string(r.Result))
+		}
+		if r.Event != "update" || r.Channel != channel {
+			continue
+		}
+		var symbol string
+		var t int64
+		var quote string
+		var closed bool
+		if market == domain.MarketTypeSpot {
+			var d gateSpotCandle
+			if err := json.Unmarshal(r.Result, &d); err != nil {
 				continue
 			}
-			parts := strings.SplitN(d.N, "_", 2)
-			if len(parts) != 2 {
+			symbol = d.N
+			t = d.T
+			quote = d.V
+			closed = d.W
+		} else {
+			var ds []gateFuturesCandle
+			if err := json.Unmarshal(r.Result, &ds); err != nil {
 				continue
 			}
-			sym := parts[1]
-			et := time.UnixMilli(r.TimeMS)
-			if r.TimeMS == 0 {
-				et = time.Now()
+			if len(ds) == 0 {
+				continue
 			}
-			sink.UpdateCandle(domain.MarketCandle{Exchange: "GATEIO", Symbol: strings.ReplaceAll(sym, "_", ""), MarketType: market, OpenTime: time.Unix(d.T, 0), CloseTime: time.Unix(d.T, 0).Add(time.Minute - time.Millisecond), QuoteVolume: v, EventTime: et, Closed: d.W})
+			d := ds[0]
+			symbol = d.N
+			t = d.T
+			quote = d.A
+		}
+		if symbol == "" || t == 0 {
+			continue
+		}
+		v, err := decimal.NewFromString(quote)
+		if err != nil || v.IsNegative() {
+			continue
+		}
+		parts := strings.SplitN(symbol, "_", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		sym := parts[1]
+		et := time.Now()
+		if r.TimeMS > 0 {
+			et = time.UnixMilli(r.TimeMS)
+		}
+		if err := sink.UpdateCandle(domain.MarketCandle{Exchange: "GATEIO", Symbol: strings.ReplaceAll(sym, "_", ""), MarketType: market, OpenTime: time.Unix(t, 0), CloseTime: time.Unix(t, 0).Add(time.Minute - time.Millisecond), QuoteVolume: v, EventTime: et, Closed: closed}); err != nil {
+			return fmt.Errorf("readCandleShard: %w", err)
 		}
 	}
 }

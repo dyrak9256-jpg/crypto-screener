@@ -30,7 +30,8 @@ func newConnectorEntry(ctx context.Context, name string, conn domain.ExchangeCon
 		go func() {
 			defer e.wg.Done()
 			if err := fn(entryCtx); err != nil && entryCtx.Err() == nil {
-				log.Printf("⚠️ [%s/%s] stopped with error: %v", name, label, err)
+				wrapped := fmt.Errorf("connector %s/%s: %w", name, label, err)
+				log.Printf("⚠️ [%s/%s] stopped with error: %v", name, label, wrapped)
 			}
 		}()
 	}
@@ -40,7 +41,17 @@ func newConnectorEntry(ctx context.Context, name string, conn domain.ExchangeCon
 		start("Candles", func(ctx context.Context) error { return cc.ConnectCandles(ctx, candleSink) })
 	}
 	if fc, ok := conn.(domain.FundingConnector); ok && fundingSink != nil {
-		start("Funding", func(ctx context.Context) error { return fc.ConnectFunding(ctx, fundingSink) })
+		start("Funding", func(ctx context.Context) error {
+			err := fc.ConnectFunding(ctx, fundingSink)
+			// A connector shutdown/error must immediately invalidate funding.
+			// The FundingManager also has TTL-based staleness, but an explicit false
+			// transition improves diagnostics and closes the failure window.
+			fundingSink.SetStreamHealth(name, false)
+			if err != nil {
+				return fmt.Errorf("funding stream: %w", err)
+			}
+			return nil
+		})
 	}
 	go func() { e.wg.Wait(); close(e.stopped) }()
 	return e
@@ -131,13 +142,16 @@ func (cm *ConnectorManager) AddConnector(parentCtx context.Context, name string,
 		return ErrManagerStopped
 	}
 	old := cm.entries[name]
-	delete(cm.entries, name)
 	cm.mu.Unlock()
-
 	if old != nil {
 		if err := old.stop(cm.stopTimeout); err != nil {
 			return fmt.Errorf("stop old connector %q: %w", name, err)
 		}
+		cm.mu.Lock()
+		if cm.entries[name] == old {
+			delete(cm.entries, name)
+		}
+		cm.mu.Unlock()
 	}
 	entry := newConnectorEntry(parentCtx, name, conn, cm.tickChan, cm.fundingSink, cm.candleSink)
 	cm.mu.Lock()
@@ -164,11 +178,18 @@ func (cm *ConnectorManager) RemoveConnector(name string) error {
 		cm.mu.Unlock()
 		return fmt.Errorf("connector %q not found", name)
 	}
-	delete(cm.entries, name)
 	cm.mu.Unlock()
 	if err := entry.stop(cm.stopTimeout); err != nil {
+		// Keep the entry registered while the old connector may still be alive.
+		// Otherwise a later AddConnector could start a second connector for the
+		// same exchange while the first one is still producing market data.
 		return fmt.Errorf("stop connector %q: %w", name, err)
 	}
+	cm.mu.Lock()
+	if cm.entries[name] == entry {
+		delete(cm.entries, name)
+	}
+	cm.mu.Unlock()
 	log.Printf("🛑 [%s] connector stopped cleanly", name)
 	return nil
 }

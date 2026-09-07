@@ -49,7 +49,10 @@ func main() {
 	}
 	defer dbRepo.Close()
 
-	application := app.NewApplication(domain.NewScreenerConfig(cfg.HardMinSpread, cfg.HardMinVolume), dbRepo, dbRepo)
+	application, err := app.NewApplication(domain.NewScreenerConfig(cfg.HardMinSpread), dbRepo, dbRepo)
+	if err != nil {
+		log.Fatalf("Application error: %v", err)
+	}
 	application.SetAdminIDs(cfg.AdminChatIDs)
 	application.SetConnectorFactory(func(name string) (domain.ExchangeConnector, bool) {
 		switch name {
@@ -76,7 +79,8 @@ func main() {
 
 	tgBot, err := telegram.NewBot(cfg.TelegramToken, application)
 	if err != nil {
-		log.Fatalf("TG Error: %v", err)
+		log.Printf("TG Error: %v", err)
+		return
 	}
 	defer tgBot.Close()
 	application.SetTelegramSender(tgBot)
@@ -90,7 +94,8 @@ func main() {
 	case err := <-appErr:
 		if err != nil {
 			cancel()
-			log.Fatalf("App failed: %v", err)
+			log.Printf("App failed: %v", err)
+			return
 		}
 	case err := <-tgErr:
 		if err != nil {
@@ -101,10 +106,4 @@ func main() {
 			log.Printf("App shutdown: %v", err)
 		}
 	}
-
-	// Детерминированное завершение: останавливаем биржевые коннекторы.
-	cm.StopAll()
-	// Корректно останавливаем Telegram-бота (дочитывает очередь, без send-on-closed).
-	tgBot.Close()
-	log.Println("✅ Engine stopped cleanly.")
 }

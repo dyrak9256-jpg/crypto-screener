@@ -360,17 +360,3 @@ func NewMockVolumeProvider(ctrl *gomock.Controller) *MockVolumeProvider {
 func (m *MockVolumeProvider) EXPECT() *MockVolumeProviderMockRecorder {
 	return m.recorder
 }
-
-// GetSymbolVolume mocks base method.
-func (m *MockVolumeProvider) GetSymbolVolume(symbol string, tf domain.Timeframe, ts time.Time) decimal.Decimal {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetSymbolVolume", symbol, tf, ts)
-	ret0, _ := ret[0].(decimal.Decimal)
-	return ret0
-}
-
-// GetSymbolVolume indicates an expected call of GetSymbolVolume.
-func (mr *MockVolumeProviderMockRecorder) GetSymbolVolume(symbol, tf, ts any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSymbolVolume", reflect.TypeOf((*MockVolumeProvider)(nil).GetSymbolVolume), symbol, tf, ts)
-}

@@ -5,13 +5,13 @@ import (
 
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestScreenerConfig_SetUserCrossSpread_EnforcesHardLimit(t *testing.T) {
 	t.Parallel()
 
 	hardLimit := decimal.RequireFromString("0.01") // 1% hard limit
-	hardVol := decimal.RequireFromString("1000000")
 
 	tests := []struct {
 		name           string
@@ -60,12 +60,12 @@ func TestScreenerConfig_SetUserCrossSpread_EnforcesHardLimit(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			cfg := NewScreenerConfig(hardLimit, hardVol)
+			cfg := NewScreenerConfig(hardLimit)
 			require.NotNil(t, cfg)
 
 			retVal := cfg.SetUserCrossSpread(tc.inputSpread)
 			assert.True(t, retVal.Equal(tc.expectedSpread), "returned value should equal expected spread")
-			assert.True(t, cfg.GetEffectiveCrossSpread().Equal(tc.expectedSpread), "effective cross spread should equal expected spread")
+			assert.True(t, cfg.GetEffectiveCrossSpread().Equal(hardLimit), "global effective spread must remain the administrative floor")
 		})
 	}
 }
@@ -73,11 +73,11 @@ func TestScreenerConfig_SetUserCrossSpread_EnforcesHardLimit(t *testing.T) {
 func TestScreenerConfig_GetCloseThreshold(t *testing.T) {
 	t.Parallel()
 
-	hardVol := decimal.RequireFromString("1000000")
+	hardLimit := decimal.RequireFromString("0.01")
 
 	t.Run("calculates half of hard spread", func(t *testing.T) {
 		t.Parallel()
-		cfg := NewScreenerConfig(hardLimit, hardVol)
+		cfg := NewScreenerConfig(hardLimit)
 		cfg.SetUserCrossSpread(decimal.RequireFromString("0.04")) // user setting does not change lifecycle threshold
 		threshold := cfg.GetCloseThreshold()
 		assert.True(t, threshold.Equal(decimal.RequireFromString("0.02")))
@@ -85,8 +85,8 @@ func TestScreenerConfig_GetCloseThreshold(t *testing.T) {
 
 	t.Run("never exceeds the open threshold", func(t *testing.T) {
 		t.Parallel()
-		cfg := NewScreenerConfig(decimal.RequireFromString("0.001"), hardVol)
+		cfg := NewScreenerConfig(decimal.RequireFromString("0.001"))
 		threshold := cfg.GetCloseThreshold()
-		assert.True(t, threshold.Equal(decimal.RequireFromString("0.0005")))
+		assert.True(t, threshold.Equal(decimal.RequireFromString("0.005")))
 	})
 }

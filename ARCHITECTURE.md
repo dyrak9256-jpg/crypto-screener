@@ -27,9 +27,10 @@ Futures vs futures between distinct exchanges. All currently fresh exchange pair
 
 ### Intra-exchange
 
-Spot vs futures on the same exchange. Both directions are supported.
+Spot vs futures on the same exchange. Only the supported route is generated:
+SPOT BUY -> FUTURES SHORT. The reverse SPOT SHORT -> FUTURES LONG route is intentionally forbidden.
 
-Funding is optional by default and direction-aware when a funding feed exists.
+Funding is route-aware and fail-closed. A missing, stale or unhealthy funding record prevents a funding-adjusted opportunity from passing the arbitrage engine.
 
 ## Signal lifecycle
 
@@ -61,7 +62,7 @@ The database schema is embedded and applied idempotently during startup, so exis
 
 This is a market-data screener, not an execution engine. A detected spread is not guaranteed net profit. Fees, slippage, order-book depth, latency and position constraints are not yet part of the PnL model.
 
-Ticker quote volume is rolling 24h volume. Timeframe-specific volume requires a separate trades/kline pipeline.
+Ticker quote volume is used for the 24h filter. The 1m/5m/15m/30m/1h/4h filters are built locally from 1-minute candle turnover, with conservative cold-start projection only when the current minute is present.
 
 ## Interval-volume pipeline (v3)
 
