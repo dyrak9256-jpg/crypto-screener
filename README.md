@@ -70,6 +70,22 @@ docker compose up --build
 
 Логи — структурированные `slog`: формат `LOG_FORMAT=text|json`, уровень `LOG_LEVEL=debug|info|warn|error`.
 
+### Grafana + Prometheus (панель мониторинга)
+
+В `docker-compose.yml` есть сервисы `prometheus` (порт **9091**) и `grafana` (порт **3000**, вход `admin`, пароль `GRAFANA_ADMIN_PASSWORD`, по умолчанию `admin`; анонимный просмотр разрешён). Конфигурация — в `observability/`:
+
+```
+observability/
+  prometheus.yml                          # scrape app:9090/metrics каждые 15с + self
+  alerts.yml                              # правила: ScreenerDown, ExchangeSilent (>5 мин),
+                                          #   FundingStale (>120с), TelegramDropped, DbErrors
+  grafana/provisioning/                   # автоподключение datasource и дашбордов
+  grafana/dashboards/crypto-screener.json # 13 панелей: тики по биржам, funding age, сигналы,
+                                          #   Telegram, очереди, алерты, heap/goroutines
+```
+
+Запуск: `docker compose up -d prometheus grafana` → дашборд «Crypto Screener — обзор» на http://localhost:3000 (автообновление 30с, история с Prometheus TSDB, retention 15 дней). Алерты видны в Prometheus `/alerts` и на панели дашборда; доставка в Telegram — через Alertmanager (P1, см. `docs/08-improvements-next.md`).
+
 ## Команды Telegram
 
 Пользовательские:

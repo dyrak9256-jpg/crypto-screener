@@ -115,9 +115,11 @@ func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) erro
 	var x struct {
 		Code string `json:"code"`
 		Data []struct {
-			Symbol          string  `json:"symbol"`
-			NextFundingRate float64 `json:"nextFundingRate"`
-			FundingTime     int64   `json:"fundingTime"`
+			Symbol string `json:"symbol"`
+			// KuCoin отдаёт nextFundingRate строкой ("0.00005"); decimal.Decimal
+			// парсит и строку, и число — устойчиво к обоим форматам.
+			NextFundingRate decimal.Decimal `json:"nextFundingRate"`
+			FundingTime     int64           `json:"fundingTime"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
@@ -129,7 +131,7 @@ func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) erro
 	now := time.Now()
 	for _, v := range x.Data {
 		symbol := strings.ReplaceAll(v.Symbol, "-", "")
-		if err := sink.UpdateFunding("KUCOIN", symbol, decimal.NewFromFloat(v.NextFundingRate), time.UnixMilli(v.FundingTime), now); err != nil {
+		if err := sink.UpdateFunding("KUCOIN", symbol, v.NextFundingRate, time.UnixMilli(v.FundingTime), now); err != nil {
 			return fmt.Errorf("update KuCoin funding %s: %w", symbol, err)
 		}
 	}

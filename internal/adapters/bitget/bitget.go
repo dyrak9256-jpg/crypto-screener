@@ -355,8 +355,8 @@ func fetchFuturesSymbols(ctx context.Context) ([]string, error) {
 	var parsed struct {
 		Code string `json:"code"`
 		Data []struct {
-			Symbol         string `json:"symbol"`
-			ContractStatus string `json:"contractStatus"`
+			Symbol       string `json:"symbol"`
+			SymbolStatus string `json:"symbolStatus"`
 		} `json:"data"`
 	}
 
@@ -369,7 +369,9 @@ func fetchFuturesSymbols(ctx context.Context) ([]string, error) {
 
 	symbols := make([]string, 0, len(parsed.Data))
 	for _, item := range parsed.Data {
-		if item.ContractStatus == "normal" {
+		// Bitget переименовал contractStatus → symbolStatus (подтверждено живым
+		// API 08.09.2026: 780 USDT-перпетуалов со статусом "normal").
+		if item.SymbolStatus == "normal" {
 			symbols = append(symbols, item.Symbol)
 		}
 	}
