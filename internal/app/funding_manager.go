@@ -163,9 +163,11 @@ func (fm *FundingManager) UpdateFunding(exchange, symbol string, rate decimal.De
 	}
 	fm.rates[key] = FundingRecord{Exchange: key.Exchange, Symbol: key.Symbol, Rate: rate, NextFundingTime: next, EventTime: event, LocalReceivedAt: now}
 	fm.SetExchangeStreamHealth(key.Exchange, true)
-	if v, loaded := fm.lastUpdate.LoadOrStore(key.Exchange, new(atomic.Int64)); loaded {
-		v.(*atomic.Int64).Store(now.UnixNano())
-	}
+	// Всегда фиксируем время получения (LoadOrStore возвращает загруженное ИЛИ
+	// новое значение — Store обязателен в обоих случаях, иначе ПЕРВЫЙ апдейт
+	// биржи оставляет lastUpdate=0 и FundingAge зря репортит "unknown").
+	v, _ := fm.lastUpdate.LoadOrStore(key.Exchange, new(atomic.Int64))
+	v.(*atomic.Int64).Store(now.UnixNano())
 	return nil
 }
 
