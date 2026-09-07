@@ -8,11 +8,13 @@ Backend скринер арбитражных возможностей на Go.
 - нормализует данные разных бирж в единый `MarketTick`;
 - ищет futures/futures между разными биржами;
 - ищет spot/futures внутри одной биржи;
+- вычитает taker-комиссии бирж из спреда — все сигналы показывают чистый (net) спред;
 - защищается от stale/out-of-order quotes;
 - отслеживает OPEN -> peak -> CLOSE;
 - сохраняет lifecycle сигналов в PostgreSQL;
 - отправляет персональные Telegram alerts по пользовательским spread/volume filters;
-- поддерживает hot add/remove connectors для администратора.
+- поддерживает hot add/remove connectors для администратора;
+- отдаёт метрики Prometheus, health-эндпоинты и статусный JSON.
 
 ## Поддерживаемые adapters
 
@@ -24,7 +26,9 @@ BINANCE, BINGX, BITGET, BYBIT, GATEIO, KUCOIN, MEXC, OKX.
 
 Funding feed реализован только для Binance. Для остальных бирж funding является optional и не блокирует raw spot/futures detection.
 
-Spread — это executable BBO spread, а не гарантированный PnL: комиссии, slippage, depth, latency и position limits пока не входят в расчёт.
+Spread — executable BBO spread за вычетом комиссий, но всё ещё не гарантированный PnL: slippage, depth, latency и position limits не входят в расчёт.
+
+**Гео-блоки:** REST/WebSocket API Binance и Bybit закрывают доступ из ряда датацентровых IP (HTTP 403/451). При старте скринер пингует все 8 бирж и громко логирует гео-блоки — результат также виден в `/api/status` (`exchange_availability`). Если биржа заблокирована, разворачивайся в разрешённом регионе или за прокси.
 
 ## Запуск
 
@@ -32,7 +36,7 @@ Spread — это executable BBO spread, а не гарантированный 
 
 ```bash
 cp .env.example .env
-# заполнить TELEGRAM_TOKEN, ADMIN_CHAT_IDS, DB_* / DATABASE_URL
+# заполнить TELEGRAM_TOKEN (или TELEGRAM_TOKENS), ADMIN_CHAT_IDS, DB_* / DATABASE_URL
 
 docker compose up --build
 ```
@@ -49,8 +53,50 @@ docker compose up --build
 ./scripts/dev-setup.sh --no-db    # пропустить установку PostgreSQL
 ```
 
-Крединалы БД переопределяются переменными `DB_USER` / `DB_PASSWORD` / `DB_NAME`.
+Пароль БД, если не задан `DB_PASSWORD`, генерируется случайно и вписывается в
+`.env`. Крединалы переопределяются переменными `DB_USER` / `DB_PASSWORD` / `DB_NAME`.
 Подробная отчётность по проекту — в каталоге [docs/](docs/).
+
+## Наблюдаемость
+
+Скринер поднимает HTTP-сервер (`METRICS_ADDR`, по умолчанию `:9090`):
+
+| Эндпоинт         | Что отдаёт                                                      |
+|------------------|-----------------------------------------------------------------|
+| `/metrics`       | Prometheus-метрики: тики по биржам, сигналы open/close, доставка Telegram, ошибки БД, глубина очередей, funding-возраст по биржам |
+| `/healthz`       | liveness-проба (JSON)                                           |
+| `/api/status`    | uptime, goroutines, очереди, активные сигналы, биржи, доступность бирж на старте |
+| `/debug/pprof/`  | профилирование Go (heap, goroutine, cpu и т.д.)                 |
+
+Логи — структурированные `slog`: формат `LOG_FORMAT=text|json`, уровень `LOG_LEVEL=debug|info|warn|error`.
+
+## Команды Telegram
+
+Пользовательские:
+
+- `/start`, `/stop` — подписка/отписка;
+- `/setcross <%>` — личный минимальный спред (net);
+- `/setvol <USDT>` — минимальный quote turnover;
+- `/settimeframe <1m|5m|15m|30m|1h|4h|24h>` — окно volume-фильтра;
+- `/setfundingtime <minutes>` — не слать сигнал ближе N минут до funding.
+
+Администраторские (`ADMIN_CHAT_IDS`):
+
+- `/sethardspread <%>` — глобальный floor спреда; персистится в PostgreSQL и переживает рестарты;
+- `/setfees [БИРЖА:ДОЛЯ,...]` — taker-комиссии; без аргументов показывает текущие; персистится;
+- `/addex <exchange>` / `/rmex <exchange>` — hot add/remove коннекторов;
+- `/stats` — статистика сигналов за 24 часа (открыто/закрыто/средний пик/длительность).
+
+Комиссии по умолчанию — консервативные 5 б.п. на сторону (`DEFAULT:0.0005`);
+глобально задаются переменной `FEES`, точечно — командой `/setfees`. Из спреда
+вычитаются обе стороны сделки до funding-оценки, порогов и фильтров.
+
+## Мульти-ботовый режим
+
+Telegram ограничивает рассылку на одного бота. `TELEGRAM_TOKENS=tok1,tok2,...`
+запускает пул ботов: пользователь закрепляется за ботом, через которого
+подписался (`users.bot_id`), и все его уведомления идут через него. Команды
+каждый бот обрабатывает сам;Broadcast разбивается по ботам.
 
 ## Проверка
 
@@ -61,12 +107,6 @@ go vet ./...
 go build ./...
 ```
 
-Полный test/race/build gate должен выполняться на машине с Go 1.26.4 и доступом к зависимостям.
-
-## Volume commands
-
-`/setvol <USDT>` — minimum quote turnover.
-`/settimeframe <1m|5m|15m|30m|1h|4h|24h>` — interval for the volume filter.
-`/setfundingtime <minutes>` — do not send a notification when the nearest funding is closer than this threshold.
-
-The global spread floor is configured with `HARD_MIN_SPREAD` (minimum 1%). Administrators can also change the runtime value with `/sethardspread <percent>`; this runtime change is not persisted to PostgreSQL yet and will revert to the environment value after restart.
+CI (`.github/workflows/ci.yml`) выполняет тот же набор на каждый push/PR: vet,
+build, test, test -race, сборка release-бинарника и проверка, что `.env` не
+попал в git.

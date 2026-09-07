@@ -3,11 +3,12 @@ package app
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
 	"crypto-screener/internal/domain"
+	"crypto-screener/internal/observability"
 )
 
 const persistenceTimeout = 5 * time.Second
@@ -28,7 +29,7 @@ func (w *PersistenceWorker) Start(shutdown context.Context, wg *sync.WaitGroup) 
 		shutdown = context.Background()
 	}
 	if w.dbChan == nil || w.signalRepo == nil {
-		log.Println("💾 Persistence worker stopped: queue or repository is nil")
+		slog.Warn("persistence worker stopped: queue or repository is nil")
 		return
 	}
 	const workerCount = 4
@@ -42,13 +43,14 @@ func (w *PersistenceWorker) Start(shutdown context.Context, wg *sync.WaitGroup) 
 					continue
 				}
 				if err := w.persist(shutdown, signal); err != nil {
-					log.Printf("❌ Failed to persist signal %s after retries: %v", signal.ID, err)
+					observability.DBError()
+					slog.Error("failed to persist signal after retries", "signal_id", signal.ID, "error", err)
 				}
 			}
 		}()
 	}
 	workers.Wait()
-	log.Println("💾 Persistence worker stopped")
+	slog.Info("persistence worker stopped")
 }
 
 func (w *PersistenceWorker) persist(shutdown context.Context, signal *domain.ArbitrageSignal) error {

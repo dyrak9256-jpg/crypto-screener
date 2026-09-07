@@ -90,3 +90,57 @@ func TestScreenerConfig_GetCloseThreshold(t *testing.T) {
 		assert.True(t, threshold.Equal(decimal.RequireFromString("0.005")))
 	})
 }
+
+func TestScreenerConfig_Fees(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewScreenerConfig(decimal.RequireFromString("0.01"))
+
+	// По умолчанию — консервативные 5 б.п. на сторону.
+	require.True(t, cfg.FeeFor("BINANCE").Equal(decimal.RequireFromString("0.0005")))
+	// Индивидуальное значение перекрывает DEFAULT.
+	cfg.SetFee("BINANCE", decimal.RequireFromString("0.0004"))
+	require.True(t, cfg.FeeFor("BINANCE").Equal(decimal.RequireFromString("0.0004")))
+	require.True(t, cfg.FeeFor("BYBIT").Equal(decimal.RequireFromString("0.0005")))
+	// DEFAULT переопределяет встроенный ориентир для всех остальных.
+	cfg.SetFee(FeeKeyDefault, decimal.RequireFromString("0.001"))
+	require.True(t, cfg.FeeFor("MEXC").Equal(decimal.RequireFromString("0.001")))
+	// Клампинг: отрицательные → 0, гигантские → 1%.
+	cfg.SetFee("KUCOIN", decimal.RequireFromString("-1"))
+	require.True(t, cfg.FeeFor("KUCOIN").IsZero())
+	cfg.SetFee("KUCOIN", decimal.NewFromInt(5))
+	require.True(t, cfg.FeeFor("KUCOIN").Equal(decimal.RequireFromString("0.01")))
+	// FeesString — детерминированный формат (ключи отсортированы).
+	require.Equal(t, "BINANCE:0.0004,DEFAULT:0.001,KUCOIN:0.01", cfg.FeesString())
+}
+
+func TestParseFees(t *testing.T) {
+	t.Parallel()
+
+	// Валидная строка с пробелами и разным регистром.
+	fees, err := ParseFees("DEFAULT:0.0005, binance : 0.0004")
+	require.NoError(t, err)
+	require.Len(t, fees, 2)
+	require.True(t, fees["BINANCE"].Equal(decimal.RequireFromString("0.0004")))
+	// Пустая строка/пустые части — пустая карта без ошибки.
+	fees, err = ParseFees("  ,")
+	require.NoError(t, err)
+	require.Empty(t, fees)
+	// Ошибки формата.
+	for _, bad := range []string{"BINANCE", "BINANCE:abc", ":0.0004", "BINANCE:-1", "BINANCE:0.5", "BINANCE:"} {
+		_, err = ParseFees(bad)
+		require.Error(t, err, "expected error for %q", bad)
+	}
+}
+
+func TestScreenerConfig_ApplyFees(t *testing.T) {
+	t.Parallel()
+
+	cfg := NewScreenerConfig(decimal.RequireFromString("0.01"))
+	require.NoError(t, cfg.ApplyFees("DEFAULT:0.0008,BINANCE:0.0002"))
+	require.True(t, cfg.FeeFor("OKX").Equal(decimal.RequireFromString("0.0008")))
+	require.True(t, cfg.FeeFor("BINANCE").Equal(decimal.RequireFromString("0.0002")))
+	// Некорректная строка не меняет текущее состояние.
+	require.Error(t, cfg.ApplyFees("OOPS"))
+	require.True(t, cfg.FeeFor("OKX").Equal(decimal.RequireFromString("0.0008")))
+}

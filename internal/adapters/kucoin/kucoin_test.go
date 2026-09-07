@@ -7,7 +7,9 @@ import (
 
 	"crypto-screener/internal/domain"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Connect* методы после H1-фикса БЛОКИРУЮТСЯ на время жизни соединения.
@@ -37,4 +39,28 @@ func TestKucoin_ConnectMethods_ReturnPromptlyOnCanceledContext(t *testing.T) {
 func TestKucoin_ImplementsExchangeConnector(t *testing.T) {
 	var _ domain.ExchangeConnector = NewAdapter()
 	assert.NotNil(t, NewAdapter())
+}
+
+func TestKucoin_ToMarketTick(t *testing.T) {
+	// Спот: BTC-USDT → BTCUSDT.
+	mt, ok := toMarketTick(&tickerData{Symbol: "BTC-USDT", BestBid: "100", BestAsk: "101", VolValue: "2000"}, domain.MarketTypeSpot)
+	require.True(t, ok)
+	require.Equal(t, "KUCOIN", mt.Exchange)
+	require.Equal(t, "BTCUSDT", mt.Symbol)
+	require.True(t, mt.QuoteVolume.Equal(decimal.NewFromInt(2000)))
+	// Фьючерс: XBTUSDTM → BTCUSDT (XBT — старое обозначение Bitcoin).
+	mt, ok = toMarketTick(&tickerData{Symbol: "XBTUSDTM", BestBidPrice: "100", BestAskPrice: "101", VolValue: "2000"}, domain.MarketTypeFutures)
+	require.True(t, ok)
+	require.Equal(t, "BTCUSDT", mt.Symbol)
+	// Фьючерс с пустыми BestBid/BestAsk использует поля *Price.
+	mt, ok = toMarketTick(&tickerData{Symbol: "ETHUSDTM", BestBid: "0", BestAsk: "0", BestBidPrice: "50", BestAskPrice: "51", Turnover24h: "777"}, domain.MarketTypeFutures)
+	require.True(t, ok)
+	require.True(t, mt.BestBid.Equal(decimal.NewFromInt(50)))
+	require.True(t, mt.QuoteVolume.Equal(decimal.NewFromInt(777)))
+	// Квартальный контракт (не perpetual) отбрасывается.
+	_, ok = toMarketTick(&tickerData{Symbol: "XBTMM24", BestBid: "100", BestAsk: "101", VolValue: "1"}, domain.MarketTypeFutures)
+	require.False(t, ok)
+	// Перекрёстный рынок.
+	_, ok = toMarketTick(&tickerData{Symbol: "BTC-USDT", BestBid: "102", BestAsk: "101", VolValue: "1"}, domain.MarketTypeSpot)
+	require.False(t, ok)
 }

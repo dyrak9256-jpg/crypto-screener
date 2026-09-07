@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,7 +92,9 @@ type FundingManager struct {
 	rates  map[fundingKey]FundingRecord
 	config atomic.Pointer[FundingConfig]
 	health sync.Map // exchange -> *atomic.Bool
-	clock  Clock
+	// lastUpdate: exchange -> время последнего funding-обновления (для метрик).
+	lastUpdate sync.Map // exchange -> *atomic.Int64 (UnixNano)
+	clock      Clock
 }
 
 func NewFundingManager(cfg FundingConfig, clock Clock) (*FundingManager, error) {
@@ -160,6 +163,9 @@ func (fm *FundingManager) UpdateFunding(exchange, symbol string, rate decimal.De
 	}
 	fm.rates[key] = FundingRecord{Exchange: key.Exchange, Symbol: key.Symbol, Rate: rate, NextFundingTime: next, EventTime: event, LocalReceivedAt: now}
 	fm.SetExchangeStreamHealth(key.Exchange, true)
+	if v, loaded := fm.lastUpdate.LoadOrStore(key.Exchange, new(atomic.Int64)); loaded {
+		v.(*atomic.Int64).Store(now.UnixNano())
+	}
 	return nil
 }
 
@@ -169,6 +175,39 @@ func (fm *FundingManager) GetFunding(exchange, symbol string) (FundingRecord, bo
 	r, ok := fm.rates[key]
 	fm.mu.RUnlock()
 	return r, ok
+}
+
+// FundingAge возвращает время с последнего funding-обновления биржи.
+// Если данных не было вовсе — возвращается -1 (метрика "unknown").
+func (fm *FundingManager) FundingAge(exchange string) time.Duration {
+	if fm == nil {
+		return -1
+	}
+	v, ok := fm.lastUpdate.Load(strings.ToUpper(strings.TrimSpace(exchange)))
+	if !ok {
+		return -1
+	}
+	ts := v.(*atomic.Int64).Load()
+	if ts <= 0 {
+		return -1
+	}
+	return fm.clock.Now().Sub(time.Unix(0, ts))
+}
+
+// KnownExchanges перечисляет биржи, от которых приходили funding-данные.
+func (fm *FundingManager) KnownExchanges() []string {
+	if fm == nil {
+		return nil
+	}
+	var out []string
+	fm.lastUpdate.Range(func(key, _ any) bool {
+		if name, ok := key.(string); ok {
+			out = append(out, name)
+		}
+		return true
+	})
+	sort.Strings(out)
+	return out
 }
 
 func (fm *FundingManager) EvictStale() {

@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    name: Build, Vet, Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Ensure .env is not tracked
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error file=.env::.env не должен попадать в git (секреты); проверь .gitignore"
+            exit 1
+          fi
+          echo "OK: .env не в индексе"
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: CGO_ENABLED=0 go build ./...
+
+      - name: go test
+        run: go test -timeout 300s ./...
+
+      - name: go test -race
+        run: go test -race -timeout 600s ./...
+
+      - name: Build release binary
+        run: CGO_ENABLED=0 go build -trimpath -ldflags="-w -s" -o screener ./cmd/screener
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-${{ runner.os }}
+          path: screener
+          retention-days: 7

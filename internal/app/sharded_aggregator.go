@@ -234,7 +234,12 @@ func (sa *ShardedAggregator) crossCandidates(byExchange map[string]map[domain.Ma
 			} else {
 				continue
 			}
-			spread := sellBid.Sub(buyAsk).Div(buyAsk)
+			// Чистый спред: из валового спреда вычитаются taker-комиссии
+			// обеих сторон сделки — до funding-оценки и порогов, поэтому
+			// все сигналы и сравнения идут в сопоставимой "net"-логике.
+			spread := sellBid.Sub(buyAsk).Div(buyAsk).
+				Sub(sa.config.FeeFor(buyEx)).
+				Sub(sa.config.FeeFor(sellEx))
 			if !spread.IsPositive() {
 				continue
 			}
@@ -271,7 +276,9 @@ func (sa *ShardedAggregator) intraCandidate(byExchange map[string]map[domain.Mar
 	if !fut.Bid.GreaterThan(spot.Ask) {
 		return domain.SpreadEvent{}, false
 	}
-	spread := fut.Bid.Sub(spot.Ask).Div(spot.Ask)
+	spread := fut.Bid.Sub(spot.Ask).Div(spot.Ask).
+		Sub(sa.config.FeeFor(exchange)). // покупка спота
+		Sub(sa.config.FeeFor(exchange))  // продажа фьючерса
 	if !spread.IsPositive() || sa.funding == nil {
 		return domain.SpreadEvent{}, false
 	}

@@ -7,7 +7,9 @@ import (
 
 	"crypto-screener/internal/domain"
 
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Connect* методы после H1-фикса БЛОКИРУЮТСЯ на время жизни соединения.
@@ -37,4 +39,24 @@ func TestBitget_ConnectMethods_ReturnPromptlyOnCanceledContext(t *testing.T) {
 func TestBitget_ImplementsExchangeConnector(t *testing.T) {
 	var _ domain.ExchangeConnector = NewAdapter()
 	assert.NotNil(t, NewAdapter())
+}
+
+func TestBitget_ToMarketTick(t *testing.T) {
+	ts := time.Now()
+	mt, ok := toMarketTick(&tickerData{InstID: "BTCUSDT", BidPr: "100", AskPr: "101", QuoteVol: "1000"}, domain.MarketTypeSpot, ts)
+	require.True(t, ok)
+	require.Equal(t, "BITGET", mt.Exchange)
+	require.Equal(t, "BTCUSDT", mt.Symbol)
+	require.True(t, mt.QuoteVolume.Equal(decimal.NewFromInt(1000)))
+	// Символ с дефисом нормализуется: BTC-USDT → BTCUSDT.
+	mt, ok = toMarketTick(&tickerData{InstID: "BTC-USDT", BidPr: "100", AskPr: "101", QuoteVol: "1000"}, domain.MarketTypeSpot, ts)
+	require.True(t, ok)
+	require.Equal(t, "BTCUSDT", mt.Symbol)
+	// Нулевой bid / перекрёстный рынок / битый объём — отбраковка.
+	_, ok = toMarketTick(&tickerData{InstID: "BTCUSDT", BidPr: "0", AskPr: "101", QuoteVol: "1"}, domain.MarketTypeSpot, ts)
+	require.False(t, ok)
+	_, ok = toMarketTick(&tickerData{InstID: "BTCUSDT", BidPr: "102", AskPr: "101", QuoteVol: "1"}, domain.MarketTypeSpot, ts)
+	require.False(t, ok)
+	_, ok = toMarketTick(&tickerData{InstID: "BTCUSDT", BidPr: "100", AskPr: "101", QuoteVol: "n/a"}, domain.MarketTypeSpot, ts)
+	require.False(t, ok)
 }

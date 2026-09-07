@@ -192,9 +192,9 @@ func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOp
 	}
 	var text string
 	if isOpened {
-		text = fmt.Sprintf("🚨 SIGNAL OPENED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nSpread: %s%%\n%s\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.InitialSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.OpenedAt.Format(time.RFC3339Nano))
+		text = fmt.Sprintf("🚨 SIGNAL OPENED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nSpread (net): %s%%\n%s\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.InitialSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.OpenedAt.Format(time.RFC3339Nano))
 	} else {
-		text = fmt.Sprintf("✅ SIGNAL CLOSED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak: %s%%\nFinal: %s%%\n%s\nDuration: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), signal.FinalSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.Duration.Round(time.Millisecond))
+		text = fmt.Sprintf("✅ SIGNAL CLOSED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nFinal (net): %s%%\n%s\nDuration: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), signal.FinalSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.Duration.Round(time.Millisecond))
 	}
 
 	job := notificationJob{text: text, chatIDs: append([]int64(nil), targets...)}

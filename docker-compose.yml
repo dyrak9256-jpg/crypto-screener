@@ -26,9 +26,19 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://${DB_USER:?DB_USER is required}:${DB_PASSWORD:?DB_PASSWORD is required}@postgres:5432/${DB_NAME:?DB_NAME is required}?sslmode=disable
-      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:?TELEGRAM_TOKEN is required}
+      # Нужен TELEGRAM_TOKEN или TELEGRAM_TOKENS (мульти-ботовый режим) —
+      # приложение завершится с понятной ошибкой, если не задан ни один.
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      TELEGRAM_TOKENS: ${TELEGRAM_TOKENS:-}
       ADMIN_CHAT_IDS: ${ADMIN_CHAT_IDS:?ADMIN_CHAT_IDS is required}
       HARD_MIN_SPREAD: ${HARD_MIN_SPREAD:-0.01}
+      FEES: ${FEES:-}
+      METRICS_ADDR: ${METRICS_ADDR:-:9090}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      # Метрики/статус: /metrics, /healthz, /api/status, /debug/pprof/
+      - "9090:9090"
     stop_grace_period: 90s
 
 volumes:

@@ -46,6 +46,31 @@ type UserRepository interface {
 	GetAllUsers(ctx context.Context) ([]*User, error)
 }
 
+// SettingsRepository — опциональная возможность репозитория: персистентность
+// настроек оператора между рестартами. Приложение проверяет её наличие по
+// образцу ReconcileActiveSignals и деградирует корректно, если её нет.
+type SettingsRepository interface {
+	GetSetting(ctx context.Context, key string) (string, bool, error)
+	SetSetting(ctx context.Context, key, value string) error
+}
+
+// StatsRepository — опциональная способность: агрегированная статистика
+// сигналов для команды /stats.
+type StatsRepository interface {
+	SignalStats24h(ctx context.Context) (SignalStats, error)
+}
+
+// SignalStats — агрегат по сигналам за последние 24 часа.
+type SignalStats struct {
+	Opened24h     int
+	Closed24h     int
+	AvgPeakSpread decimal.Decimal
+	AvgDuration   time.Duration
+}
+
 type CommandHandler interface {
-	HandleCommand(chatID int64, username string, cmd string, args []string) string
+	// botID identifies the Telegram bot instance that received the command
+	// (0 when a single bot is deployed). It is stored with the user so
+	// notifications can be routed back through the same bot.
+	HandleCommand(botID, chatID int64, username string, cmd string, args []string) string
 }

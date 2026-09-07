@@ -324,17 +324,17 @@ func (m *MockCommandHandler) EXPECT() *MockCommandHandlerMockRecorder {
 }
 
 // HandleCommand mocks base method.
-func (m *MockCommandHandler) HandleCommand(chatID int64, username, cmd string, args []string) string {
+func (m *MockCommandHandler) HandleCommand(botID, chatID int64, username, cmd string, args []string) string {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "HandleCommand", chatID, username, cmd, args)
+	ret := m.ctrl.Call(m, "HandleCommand", botID, chatID, username, cmd, args)
 	ret0, _ := ret[0].(string)
 	return ret0
 }
 
 // HandleCommand indicates an expected call of HandleCommand.
-func (mr *MockCommandHandlerMockRecorder) HandleCommand(chatID, username, cmd, args any) *gomock.Call {
+func (mr *MockCommandHandlerMockRecorder) HandleCommand(botID, chatID, username, cmd, args any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HandleCommand", reflect.TypeOf((*MockCommandHandler)(nil).HandleCommand), chatID, username, cmd, args)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HandleCommand", reflect.TypeOf((*MockCommandHandler)(nil).HandleCommand), botID, chatID, username, cmd, args)
 }
 
 // MockVolumeProvider is a mock of VolumeProvider interface.

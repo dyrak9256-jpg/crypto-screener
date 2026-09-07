@@ -13,6 +13,9 @@ type User struct {
 	MinVolume         decimal.Decimal
 	Timeframe         Timeframe
 	MinFundingMinutes int
+	// BotID identifies which Telegram bot instance serves this user when
+	// several bot tokens share the delivery load (TELEGRAM_TOKENS).
+	BotID int64
 }
 
 type UserManager struct {

@@ -60,3 +60,24 @@ func TestDecodeMEXCSpotKlineRejectsMissingPayload(t *testing.T) {
 	_, err := decodeMEXCSpotKline(appendString(nil, 1, "spot@public.kline.v3.api.pb@BTCUSDT@Min1"))
 	require.Error(t, err)
 }
+
+// FuzzDecodeMEXCSpotKline гарантирует, что ручной protobuf-парсер не паникует
+// на произвольных байтах: MEXC-канал данных не контролируется нами.
+func FuzzDecodeMEXCSpotKline(f *testing.F) {
+	kline := []byte{}
+	kline = appendString(kline, 1, "Min1")
+	kline = appendInt64(kline, 2, 1736410500)
+	kline = appendInt64(kline, 3, 1736410500)
+	f.Add(kline)
+	f.Add([]byte{})
+	f.Add([]byte{0xff})
+	f.Add([]byte{0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01})
+	f.Add([]byte{0x1a, 0x05, 'h', 'e', 'l', 'l', 'o'})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		// Ошибка допустима (мусорный ввод), паника или зависание — нет.
+		out, err := decodeMEXCSpotKline(data)
+		if err == nil {
+			_ = out
+		}
+	})
+}

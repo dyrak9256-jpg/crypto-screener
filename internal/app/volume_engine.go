@@ -34,7 +34,11 @@ type VolumeEngine struct {
 }
 
 func NewVolumeEngine() *VolumeEngine {
-	return &VolumeEngine{data: make(map[string]*volumeSeries), retention: 24*time.Hour + 2*time.Minute, clock: time.Now}
+	// Самое длинное окно оценки — TF_4h, поэтому хранить историю дольше
+	// 4 часов бессмысленно: TF_24h считается из 24h-QuoteVolume тикера, а не
+	// из поминутного ряда. Retention 4h+2m снижает память серии в ~6 раз
+	// по сравнению с прежними 24h.
+	return &VolumeEngine{data: make(map[string]*volumeSeries), retention: 4*time.Hour + 2*time.Minute, clock: time.Now}
 }
 func volumeKey(exchange, symbol string, market domain.MarketType) string {
 	return strings.ToUpper(exchange) + "|" + strings.ToUpper(symbol) + "|" + string(market)

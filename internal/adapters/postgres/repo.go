@@ -2,12 +2,15 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	_ "embed"
+	"errors"
 	"fmt"
 	"time"
 
 	"crypto-screener/internal/domain"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
@@ -56,6 +59,68 @@ func (r *Repository) Close() {
 	if r != nil && r.pool != nil {
 		r.pool.Close()
 	}
+}
+
+// GetSetting возвращает значение настройки по ключу. Второе значение —
+// наличие ключа, чтобы отличать "не задано" от пустой строки.
+func (r *Repository) GetSetting(ctx context.Context, key string) (string, bool, error) {
+	if r == nil || r.pool == nil {
+		return "", false, fmt.Errorf("postgres repository is nil")
+	}
+	var value string
+	err := r.pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = $1`, key).Scan(&value)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get setting %q: %w", key, err)
+	}
+	return value, true, nil
+}
+
+// SetSetting атомарно сохраняет настройку (upsert).
+func (r *Repository) SetSetting(ctx context.Context, key, value string) error {
+	if r == nil || r.pool == nil {
+		return fmt.Errorf("postgres repository is nil")
+	}
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, NOW())
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+		key, value)
+	if err != nil {
+		return fmt.Errorf("set setting %q: %w", key, err)
+	}
+	return nil
+}
+
+// SignalStats24h агрегирует сигналы за последние 24 часа для команды /stats.
+func (r *Repository) SignalStats24h(ctx context.Context) (domain.SignalStats, error) {
+	if r == nil || r.pool == nil {
+		return domain.SignalStats{}, fmt.Errorf("postgres repository is nil")
+	}
+	var (
+		opened, closed int
+		avgPeak        sql.NullFloat64
+		avgDurationMs  sql.NullFloat64
+	)
+	err := r.pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE opened_at > NOW() - INTERVAL '24 hours'),
+			COUNT(*) FILTER (WHERE closed_at > NOW() - INTERVAL '24 hours'),
+			AVG(peak_spread) FILTER (WHERE closed_at > NOW() - INTERVAL '24 hours'),
+			AVG(duration_ms) FILTER (WHERE closed_at > NOW() - INTERVAL '24 hours')
+		FROM signals`).Scan(&opened, &closed, &avgPeak, &avgDurationMs)
+	if err != nil {
+		return domain.SignalStats{}, fmt.Errorf("signal stats 24h: %w", err)
+	}
+	stats := domain.SignalStats{Opened24h: opened, Closed24h: closed}
+	if avgPeak.Valid {
+		stats.AvgPeakSpread = decimal.NewFromFloat(avgPeak.Float64)
+	}
+	if avgDurationMs.Valid {
+		stats.AvgDuration = time.Duration(avgDurationMs.Float64 * float64(time.Millisecond))
+	}
+	return stats, nil
 }
 
 // ReconcileActiveSignals closes signals that were left active by a previous
@@ -133,14 +198,15 @@ func (r *Repository) SaveUser(ctx context.Context, u *domain.User) error {
 		return fmt.Errorf("user is nil")
 	}
 	const query = `
-		INSERT INTO users (chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes)
-		VALUES ($1,$2,$3,$4,$5,$6)
+		INSERT INTO users (chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, bot_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT (chat_id) DO UPDATE SET
 			username   = EXCLUDED.username,
 			min_spread = EXCLUDED.min_spread,
 			min_volume = EXCLUDED.min_volume,
 			timeframe  = EXCLUDED.timeframe,
-			min_funding_minutes = EXCLUDED.min_funding_minutes`
+			min_funding_minutes = EXCLUDED.min_funding_minutes,
+			bot_id     = EXCLUDED.bot_id`
 
 	_, err := r.pool.Exec(ctx, query,
 		u.ChatID,
@@ -149,6 +215,7 @@ func (r *Repository) SaveUser(ctx context.Context, u *domain.User) error {
 		u.MinVolume.String(),
 		string(u.Timeframe),
 		u.MinFundingMinutes,
+		u.BotID,
 	)
 	if err != nil {
 		return fmt.Errorf("save user %d: %w", u.ChatID, err)
@@ -173,7 +240,7 @@ func (r *Repository) GetAllUsers(ctx context.Context) ([]*domain.User, error) {
 		return nil, fmt.Errorf("postgres repository is nil")
 	}
 	const query = `
-		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes
+		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, bot_id
 		FROM users`
 
 	rows, err := r.pool.Query(ctx, query)
@@ -207,7 +274,7 @@ func (r *Repository) GetUserByChatID(ctx context.Context, chatID int64) (*domain
 		return nil, fmt.Errorf("postgres repository is nil")
 	}
 	const query = `
-		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes
+		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, bot_id
 		FROM users WHERE chat_id = $1`
 
 	rows, err := r.pool.Query(ctx, query, chatID)
@@ -241,6 +308,7 @@ func scanUser(rows interface {
 		&volStr,
 		&u.Timeframe,
 		&u.MinFundingMinutes,
+		&u.BotID,
 	); err != nil {
 		return nil, fmt.Errorf("scan user row: %w", err)
 	}

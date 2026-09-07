@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"crypto-screener/internal/domain"
+	"crypto-screener/internal/observability"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -30,6 +31,8 @@ type commandRequest struct {
 }
 
 type Bot struct {
+	// id идентифицирует бота внутри пула (индекс токена в TELEGRAM_TOKENS).
+	id         int64
 	api        *tgbotapi.BotAPI
 	sendChan   chan tgbotapi.Chattable
 	cmdHandler domain.CommandHandler
@@ -42,7 +45,7 @@ type Bot struct {
 	sendStop   chan struct{}
 }
 
-func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
+func NewBot(id int64, token string, handler domain.CommandHandler) (*Bot, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("telegram token is empty")
 	}
@@ -50,7 +53,7 @@ func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init telegram bot: %w", err)
 	}
-	b := &Bot{api: api, cmdHandler: handler, sendChan: make(chan tgbotapi.Chattable, sendChanBuffer), commands: make(chan commandRequest, commandQueueBuffer), sendStop: make(chan struct{})}
+	b := &Bot{id: id, api: api, cmdHandler: handler, sendChan: make(chan tgbotapi.Chattable, sendChanBuffer), commands: make(chan commandRequest, commandQueueBuffer), sendStop: make(chan struct{})}
 	b.sendWg.Add(1)
 	go b.sendWorker()
 	for i := 0; i < commandWorkers; i++ {
@@ -65,7 +68,7 @@ func (b *Bot) commandWorker() {
 		if b.cmdHandler == nil {
 			continue
 		}
-		response := b.cmdHandler.HandleCommand(req.chatID, req.username, req.command, req.args)
+		response := b.cmdHandler.HandleCommand(b.id, req.chatID, req.username, req.command, req.args)
 		b.SendPrivateMessage(req.chatID, response)
 	}
 }
@@ -106,11 +109,17 @@ func (b *Bot) sendWorker() {
 					case <-timer.C:
 					}
 					if _, retryErr := b.api.Send(msg); retryErr != nil {
-						log.Printf("⚠️ Telegram retry error: %v", retryErr)
+						observability.TelegramDropped()
+						slog.Warn("telegram retry send failed", "bot_id", b.id, "error", retryErr)
+					} else {
+						observability.TelegramSent()
 					}
 				} else {
-					log.Printf("⚠️ Telegram send error: %v", err)
+					observability.TelegramDropped()
+					slog.Warn("telegram send failed", "bot_id", b.id, "error", err)
 				}
+			} else {
+				observability.TelegramSent()
 			}
 		}
 	}
@@ -139,7 +148,8 @@ func (b *Bot) SendPrivateMessage(chatID int64, text string) {
 	select {
 	case b.sendChan <- msg:
 	default:
-		log.Printf("⚠️ Telegram send queue full, message to chat_id %d dropped", chatID)
+		observability.TelegramDropped()
+		slog.Warn("telegram send queue full, message dropped", "bot_id", b.id, "chat_id", chatID)
 	}
 }
 func (b *Bot) Broadcast(text string, chatIDs []int64) {
@@ -153,7 +163,8 @@ func (b *Bot) Broadcast(text string, chatIDs []int64) {
 		select {
 		case b.sendChan <- msg:
 		default:
-			log.Printf("⚠️ Telegram send queue full, broadcast to chat_id %d dropped", id)
+			observability.TelegramDropped()
+			slog.Warn("telegram send queue full, broadcast dropped", "bot_id", b.id, "chat_id", id)
 		}
 		b.sendMu.RUnlock()
 	}
@@ -217,7 +228,7 @@ func (b *Bot) StartPolling(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				log.Printf("⚠️ Telegram command queue full; dropping /%s from %d", req.command, req.chatID)
+				slog.Warn("telegram command queue full, command dropped", "bot_id", b.id, "command", req.command, "chat_id", req.chatID)
 			}
 		}
 	}

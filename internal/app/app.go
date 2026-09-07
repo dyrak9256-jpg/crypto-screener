@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"log"
+	"log/slog"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,26 +15,41 @@ import (
 
 	"crypto-screener/internal/domain"
 	"crypto-screener/internal/ingress"
+	"crypto-screener/internal/observability"
 	"github.com/shopspring/decimal"
 )
 
 const userPersistenceTimeout = 5 * time.Second
+
+// SupportedExchanges — полный список бирж, поддерживаемых коннекторами.
+// Используется для метрик funding-возраста и стартовой проверки доступности.
+var SupportedExchanges = []string{"BINANCE", "BINGX", "BITGET", "BYBIT", "GATEIO", "KUCOIN", "MEXC", "OKX"}
+
+// Ключи персистентных настроек оператора (таблица settings).
+const (
+	settingsKeyHardSpread = "hard_min_spread"
+	settingsKeyFees       = "fees"
+)
 
 var ErrApplicationAlreadyStarted = errors.New("application has already been started")
 
 type ConnectorFactory func(name string) (domain.ExchangeConnector, bool)
 
 type Application struct {
-	connManager      *ConnectorManager
-	aggregator       *ShardedAggregator
-	volume           *VolumeEngine
-	tracker          *Tracker
-	fundingMgr       *FundingManager
-	config           *domain.ScreenerConfig
-	adminMu          sync.RWMutex
-	adminIDs         []int64
-	userMgr          *domain.UserManager
-	userRepo         domain.UserRepository
+	connManager *ConnectorManager
+	aggregator  *ShardedAggregator
+	volume      *VolumeEngine
+	tracker     *Tracker
+	fundingMgr  *FundingManager
+	config      *domain.ScreenerConfig
+	adminMu     sync.RWMutex
+	adminIDs    []int64
+	userMgr     *domain.UserManager
+	userRepo    domain.UserRepository
+	// Опциональные возможности репозитория (postgres их реализует);
+	// при отсутствии приложение корректно деградирует.
+	settingsRepo     domain.SettingsRepository
+	statsRepo        domain.StatsRepository
 	router           *NotificationRouter
 	tickChan         chan domain.MarketTick
 	trackerChan      chan domain.SpreadEvent
@@ -74,7 +89,14 @@ func NewApplication(cfg *domain.ScreenerConfig, repo domain.SignalRepository, us
 	router := NewNotificationRouter(userMgr, nil, volume)
 	tracker := NewTracker(cfg, dbChan, router)
 	connMgr := NewConnectorManager(tickChan, fundingMgr, volume)
-	return &Application{connManager: connMgr, aggregator: aggregator, tracker: tracker, fundingMgr: fundingMgr, volume: volume, config: cfg, userMgr: userMgr, userRepo: userRepo, router: router, tickChan: tickChan, trackerChan: trackerChan, dbChan: dbChan}, nil
+	a := &Application{connManager: connMgr, aggregator: aggregator, tracker: tracker, fundingMgr: fundingMgr, volume: volume, config: cfg, userMgr: userMgr, userRepo: userRepo, router: router, tickChan: tickChan, trackerChan: trackerChan, dbChan: dbChan}
+	if settingsRepo, ok := repo.(domain.SettingsRepository); ok {
+		a.settingsRepo = settingsRepo
+	}
+	if statsRepo, ok := repo.(domain.StatsRepository); ok {
+		a.statsRepo = statsRepo
+	}
+	return a, nil
 }
 func (a *Application) SetTelegramSender(tg domain.TelegramSender) { a.router.SetTelegramSender(tg) }
 func (a *Application) SetAdminIDs(ids []int64) {
@@ -127,6 +149,15 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 		}
 	}
 	a.ctx.Store(&ctx)
+	// Репозиторий передаётся в Run отдельно: берём из него опциональные
+	// возможности, если NewApplication их ещё не увидел.
+	if settingsRepo, ok := repo.(domain.SettingsRepository); ok {
+		a.settingsRepo = settingsRepo
+	}
+	if statsRepo, ok := repo.(domain.StatsRepository); ok {
+		a.statsRepo = statsRepo
+	}
+	a.loadOperatorSettings(ctx)
 
 	var persistCancel context.CancelFunc
 	persistStarted, dispatchStarted, trackerStarted := false, false, false
@@ -228,7 +259,7 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 			}
 			a.userMgr.SetUser(u)
 		}
-		log.Printf("✅ Loaded %d users from DB", len(users))
+		slog.Info("loaded users from database", "count", len(users))
 	}
 	factory, hasFactory := a.connectorFactory.Load().(ConnectorFactory)
 	if hasFactory && factory == nil {
@@ -264,8 +295,9 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 	a.trackerWg.Add(1)
 	go a.trackerWorker()
 	trackerStarted = true
+	a.registerMetrics()
 	if factory != nil {
-		for _, name := range []string{"BINANCE", "BINGX", "BITGET", "BYBIT", "GATEIO", "KUCOIN", "MEXC", "OKX"} {
+		for _, name := range SupportedExchanges {
 			conn, ok := factory(name)
 			if !ok || conn == nil {
 				cleanup()
@@ -282,7 +314,7 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 	if err := cleanup(); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
 	}
-	log.Println("✅ Shutdown complete")
+	slog.Info("shutdown complete")
 	return nil
 }
 
@@ -325,6 +357,7 @@ func (a *Application) ingestionWorker(q <-chan domain.MarketTick) {
 				return
 			}
 			a.aggregator.ProcessTick(tick)
+			observability.Tick(tick.Exchange)
 		}
 	}
 }
@@ -334,6 +367,106 @@ func (a *Application) trackerWorker() {
 	for event := range a.trackerChan {
 		a.tracker.HandleEvent(event)
 	}
+}
+
+// loadOperatorSettings восстанавливает персистентные настройки оператора
+// (hard floor спреда, комиссии) из таблицы settings. Вызывается один раз в Run.
+func (a *Application) loadOperatorSettings(ctx context.Context) {
+	if a.settingsRepo == nil {
+		return
+	}
+	if v, ok, err := a.settingsRepo.GetSetting(ctx, settingsKeyHardSpread); err != nil {
+		slog.Warn("load hard_min_spread setting failed", "error", err)
+	} else if ok {
+		if d, perr := decimal.NewFromString(v); perr != nil {
+			slog.Warn("stored hard_min_spread is not a decimal", "value", v)
+		} else if !d.LessThan(decimal.RequireFromString("0.01")) {
+			fundingCfg := DefaultFundingConfig()
+			fundingCfg.MinSpread = d
+			if uerr := a.fundingMgr.UpdateConfig(fundingCfg); uerr != nil {
+				slog.Warn("apply stored hard_min_spread to funding config failed", "error", uerr)
+			} else {
+				a.config.SetHardMinSpread(d)
+				slog.Info("restored hard_min_spread from settings", "value", d.String())
+			}
+		} else {
+			slog.Warn("stored hard_min_spread below absolute minimum, ignored", "value", v)
+		}
+	}
+	if v, ok, err := a.settingsRepo.GetSetting(ctx, settingsKeyFees); err != nil {
+		slog.Warn("load fees setting failed", "error", err)
+	} else if ok {
+		if aerr := a.config.ApplyFees(v); aerr != nil {
+			slog.Warn("stored fees setting invalid", "value", v, "error", aerr)
+		} else {
+			slog.Info("restored fees from settings", "fees", a.config.FeesString())
+		}
+	}
+}
+
+// persistSetting сохраняет настройку оператора в БД. Без SettingsRepository
+// (например, в тестах с моками) — тихий no-op: значение действует до рестарта.
+func (a *Application) persistSetting(key, value string) error {
+	if a.settingsRepo == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(a.getContext()), 5*time.Second)
+	defer cancel()
+	return a.settingsRepo.SetSetting(ctx, key, value)
+}
+
+// registerMetrics подключает очереди и агрегаты приложения к observability.
+func (a *Application) registerMetrics() {
+	observability.WatchQueue("ticks", func() int { return len(a.tickChan) })
+	observability.WatchQueue("tracker_events", func() int { return len(a.trackerChan) })
+	observability.WatchQueue("db_signals", func() int { return len(a.dbChan) })
+	observability.RegisterGaugeFunc("screener_active_signals", "Currently active arbitrage signals.", func() float64 {
+		return float64(a.tracker.ActiveCount())
+	})
+	observability.RegisterGaugeFunc("screener_connected_exchanges", "Number of connected exchanges.", func() float64 {
+		return float64(a.connManager.Count())
+	})
+	for _, ex := range SupportedExchanges {
+		observability.RegisterExchangeGaugeFunc("screener_funding_age_seconds",
+			"Seconds since last funding update per exchange; -1 = no data yet.",
+			ex, func() float64 {
+				if d := a.fundingMgr.FundingAge(ex); d >= 0 {
+					return d.Seconds()
+				}
+				return -1
+			})
+	}
+}
+
+// RouteBot возвращает идентификатор Telegram-бота, обслуживающего чат.
+// Используется BotPool'ом в мульти-токенном режиме; для новых/неизвестных
+// чатов — бот по умолчанию (id 0).
+func (a *Application) RouteBot(chatID int64) int64 {
+	if u, ok := a.userMgr.GetUser(chatID); ok && u != nil {
+		return u.BotID
+	}
+	return 0
+}
+
+// StatusSnapshot собирает живое состояние приложения для /api/status.
+func (a *Application) StatusSnapshot() map[string]any {
+	snapshot := map[string]any{
+		"active_signals":      a.tracker.ActiveCount(),
+		"connected_exchanges": a.connManager.Count(),
+	}
+	if names := a.connManager.Names(); len(names) > 0 {
+		snapshot["exchanges"] = names
+	}
+	ages := make(map[string]string, len(SupportedExchanges))
+	for _, ex := range SupportedExchanges {
+		if d := a.fundingMgr.FundingAge(ex); d >= 0 {
+			ages[ex] = d.Round(time.Second).String()
+		} else {
+			ages[ex] = "no data"
+		}
+	}
+	snapshot["funding_age"] = ages
+	return snapshot
 }
 
 func (a *Application) persistUser(user *domain.User) error {
@@ -362,7 +495,7 @@ func (a *Application) deleteUser(chatID int64) error {
 	return nil
 }
 
-func (a *Application) HandleCommand(chatID int64, username, cmd string, args []string) string {
+func (a *Application) HandleCommand(botID, chatID int64, username, cmd string, args []string) string {
 	a.commandMu.Lock()
 	defer a.commandMu.Unlock()
 	if !a.accepting.Load() {
@@ -370,7 +503,7 @@ func (a *Application) HandleCommand(chatID int64, username, cmd string, args []s
 	}
 	// Admin commands must work without a subscription: an administrator is not
 	// required to be a signal subscriber to manage the screener.
-	isAdminCmd := cmd == "addex" || cmd == "rmex" || cmd == "sethardspread"
+	isAdminCmd := cmd == "addex" || cmd == "rmex" || cmd == "sethardspread" || cmd == "setfees" || cmd == "stats"
 	if isAdminCmd && !a.isAdmin(chatID) {
 		return "⛔ Access Denied."
 	}
@@ -383,7 +516,7 @@ func (a *Application) HandleCommand(chatID int64, username, cmd string, args []s
 		if exists {
 			return "✅ Вы уже подписаны! /help — список команд."
 		}
-		u := &domain.User{ChatID: chatID, Username: username, MinSpread: a.config.GetHardMinSpread(), MinVolume: decimal.Zero, Timeframe: domain.TF_15m, MinFundingMinutes: 30}
+		u := &domain.User{ChatID: chatID, Username: username, MinSpread: a.config.GetHardMinSpread(), MinVolume: decimal.Zero, Timeframe: domain.TF_15m, MinFundingMinutes: 30, BotID: botID}
 		if err := a.persistUser(u); err != nil {
 			return fmt.Sprintf("❌ Не удалось сохранить подписку: %v", err)
 		}
@@ -416,7 +549,10 @@ func (a *Application) HandleCommand(chatID int64, username, cmd string, args []s
 			return fmt.Sprintf("❌ Не удалось обновить funding-конфигурацию: %v", err)
 		}
 		spread = a.config.SetHardMinSpread(spread)
-		return fmt.Sprintf("✅ Глобальный hard floor спреда: %s%%", spread.Mul(decimal.NewFromInt(100)).StringFixed(2))
+		if err := a.persistSetting(settingsKeyHardSpread, spread.String()); err != nil {
+			return fmt.Sprintf("⚠️ Порог применён, но не сохранён в БД (подействует до рестарта): %v", err)
+		}
+		return fmt.Sprintf("✅ Глобальный hard floor спреда: %s%% (сохранено)", spread.Mul(decimal.NewFromInt(100)).StringFixed(2))
 	case "setcross":
 		if len(args) < 1 {
 			return "Usage: /setcross <percent>"
@@ -488,8 +624,48 @@ func (a *Application) HandleCommand(chatID int64, username, cmd string, args []s
 		}
 		a.userMgr.SetUser(&u)
 		return fmt.Sprintf("✅ Таймфрейм: %s", tf)
+	case "setfees":
+		if !a.isAdmin(chatID) {
+			return "⛔ Access Denied."
+		}
+		if len(args) == 0 {
+			return "💰 Комиссии (taker, доля на сторону сделки):\n" + a.config.FeesString() + "\n\nUsage: /setfees БИРЖА:ДОЛЯ[,БИРЖА:ДОЛЯ...]\nПример: /setfees DEFAULT:0.0005,BINANCE:0.0004\nDEFAULT применяется ко всем биржам без своего значения."
+		}
+		parsed, err := domain.ParseFees(strings.Join(args, ","))
+		if err != nil {
+			return fmt.Sprintf("❌ %v", err)
+		}
+		for k, v := range parsed {
+			a.config.SetFee(k, v)
+		}
+		if err := a.persistSetting(settingsKeyFees, a.config.FeesString()); err != nil {
+			return fmt.Sprintf("⚠️ Комиссии применены, но не сохранены в БД: %v", err)
+		}
+		return "✅ Комиссии обновлены:\n" + a.config.FeesString()
+	case "stats":
+		if !a.isAdmin(chatID) {
+			return "⛔ Access Denied."
+		}
+		if a.statsRepo == nil {
+			return "❌ Статистика недоступна: репозиторий не поддерживает агрегаты."
+		}
+		statsCtx, cancel := context.WithTimeout(context.WithoutCancel(a.getContext()), 5*time.Second)
+		defer cancel()
+		st, err := a.statsRepo.SignalStats24h(statsCtx)
+		if err != nil {
+			return fmt.Sprintf("❌ Ошибка статистики: %v", err)
+		}
+		avgPeak := "—"
+		if !st.AvgPeakSpread.IsZero() {
+			avgPeak = st.AvgPeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4) + "%"
+		}
+		avgDur := "—"
+		if st.AvgDuration > 0 {
+			avgDur = st.AvgDuration.Round(time.Second).String()
+		}
+		return fmt.Sprintf("📊 Статистика за 24 часа:\nОткрыто сигналов: %d\nЗакрыто: %d\nСредний пик спреда (net): %s\nСредняя длительность: %s\nАктивно сейчас: %d", st.Opened24h, st.Closed24h, avgPeak, avgDur, a.tracker.ActiveCount())
 	case "help":
-		return "📋 *Доступные команды:*\n/start — Подписаться на сигналы\n/stop — Отписаться\n/sethardspread <%> — Глобальный минимум спреда\n/setcross <%> — Мин. спред\n/setvol <USDT> — Мин. объём\n/settimeframe <tf> — Таймфрейм\n/setfundingtime <minutes> — Не присылать сигнал ближе к funding"
+		return "📋 *Доступные команды:*\n/start — Подписаться на сигналы\n/stop — Отписаться\n/setcross <%> — Мин. спред\n/setvol <USDT> — Мин. объём\n/settimeframe <tf> — Таймфрейм\n/setfundingtime <minutes> — Не присылать сигнал ближе к funding\n\n*Администраторам:*\n/sethardspread <%> — Глобальный минимум спреда\n/setfees — Комиссии бирж (учитываются в спреде)\n/addex /rmex — Подключение бирж на лету\n/stats — Статистика сигналов за 24 часа"
 	case "addex":
 		if len(args) < 1 {
 			return "Usage: /addex <exchange>"
