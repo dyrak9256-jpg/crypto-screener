@@ -65,8 +65,11 @@ func (r FundingRecord) IsStale(now time.Time, max time.Duration) bool {
 	if r.LocalReceivedAt.IsZero() || max <= 0 {
 		return true
 	}
+	// Only true age beyond the budget makes a record stale. A slightly negative
+	// age (record received right after the price tick it is evaluated against)
+	// means the funding snapshot is fresh, not stale.
 	age := now.Sub(r.LocalReceivedAt)
-	return age < 0 || age > max
+	return age > max
 }
 
 type ArbResult struct {

@@ -136,12 +136,10 @@ func (b *Bot) SendPrivateMessage(chatID int64, text string) {
 	if b.closed.Load() {
 		return
 	}
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
 	select {
 	case b.sendChan <- msg:
-	case <-timer.C:
-		log.Printf("⚠️ Telegram send timeout for chat_id %d", chatID)
+	default:
+		log.Printf("⚠️ Telegram send queue full, message to chat_id %d dropped", chatID)
 	}
 }
 func (b *Bot) Broadcast(text string, chatIDs []int64) {
@@ -152,12 +150,10 @@ func (b *Bot) Broadcast(text string, chatIDs []int64) {
 			b.sendMu.RUnlock()
 			return
 		}
-		timer := time.NewTimer(5 * time.Second)
 		select {
 		case b.sendChan <- msg:
-			timer.Stop()
-		case <-timer.C:
-			log.Printf("⚠️ Telegram send queue timeout for chat_id %d", id)
+		default:
+			log.Printf("⚠️ Telegram send queue full, broadcast to chat_id %d dropped", id)
 		}
 		b.sendMu.RUnlock()
 	}
@@ -175,6 +171,16 @@ func (b *Bot) Close() {
 			close(b.sendStop)
 		}
 		if b.sendChan != nil {
+			// Drain pending messages so the closed channel reads as empty:
+			// after shutdown nobody consumes them anyway.
+		drain:
+			for {
+				select {
+				case <-b.sendChan:
+				default:
+					break drain
+				}
+			}
 			close(b.sendChan)
 		}
 		b.sendMu.Unlock()

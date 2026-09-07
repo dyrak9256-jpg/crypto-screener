@@ -368,11 +368,14 @@ func (a *Application) HandleCommand(chatID int64, username, cmd string, args []s
 	if !a.accepting.Load() {
 		return "⚠️ Двигатель сейчас остановлен."
 	}
-	if (cmd == "addex" || cmd == "rmex") && !a.isAdmin(chatID) {
+	// Admin commands must work without a subscription: an administrator is not
+	// required to be a signal subscriber to manage the screener.
+	isAdminCmd := cmd == "addex" || cmd == "rmex" || cmd == "sethardspread"
+	if isAdminCmd && !a.isAdmin(chatID) {
 		return "⛔ Access Denied."
 	}
 	user, exists := a.userMgr.GetUser(chatID)
-	if !exists && cmd != "start" {
+	if !exists && cmd != "start" && !isAdminCmd {
 		return "⚠️ Вы не подписаны. Отправьте /start для начала работы."
 	}
 	switch cmd {

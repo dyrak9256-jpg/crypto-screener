@@ -41,51 +41,49 @@ func decodeMEXCSpotKline(data []byte) (mexcSpotKline, error) {
 				out.SendTime = int64(value)
 			}
 		case 2:
-			// Unknown/non-used field. Skip it safely.
-			var err error
-			data, err = skipProtoBytes(data)
-			if err != nil {
-				return mexcSpotKline{}, fmt.Errorf("skip wrapper field %d: %w", field, err)
+			switch field {
+			case 1:
+				value, n, err := readProtoBytes(data)
+				if err != nil {
+					return mexcSpotKline{}, fmt.Errorf("read wrapper channel: %w", err)
+				}
+				data = data[n:]
+				out.Channel = string(value)
+			case 3, 4:
+				value, n, err := readProtoBytes(data)
+				if err != nil {
+					return mexcSpotKline{}, fmt.Errorf("read wrapper field %d: %w", field, err)
+				}
+				data = data[n:]
+				if field == 3 {
+					out.Symbol = string(value)
+				}
+			case 308:
+				value, n, err := readProtoBytes(data)
+				if err != nil {
+					return mexcSpotKline{}, fmt.Errorf("read wrapper spot kline: %w", err)
+				}
+				data = data[n:]
+				klinePayload = append(klinePayload[:0], value...)
+			default:
+				// Unknown/non-used field. Skip it safely.
+				data, err = skipProtoBytes(data)
+				if err != nil {
+					return mexcSpotKline{}, fmt.Errorf("skip wrapper field %d: %w", field, err)
+				}
 			}
 		case 1:
-			value, n, err := readProtoBytes(data)
-			if err != nil {
-				return mexcSpotKline{}, fmt.Errorf("read wrapper channel: %w", err)
+			if len(data) < 8 {
+				return mexcSpotKline{}, fmt.Errorf("skip wrapper field %d: truncated fixed64", field)
 			}
-			data = data[n:]
-			out.Channel = string(value)
-		case 3, 4:
-			value, n, err := readProtoBytes(data)
-			if err != nil {
-				return mexcSpotKline{}, fmt.Errorf("read wrapper field %d: %w", field, err)
+			data = data[8:]
+		case 5:
+			if len(data) < 4 {
+				return mexcSpotKline{}, fmt.Errorf("skip wrapper field %d: truncated fixed32", field)
 			}
-			data = data[n:]
-			if field == 3 {
-				out.Symbol = string(value)
-			}
-		case 308:
-			value, n, err := readProtoBytes(data)
-			if err != nil {
-				return mexcSpotKline{}, fmt.Errorf("read wrapper spot kline: %w", err)
-			}
-			data = data[n:]
-			klinePayload = append(klinePayload[:0], value...)
+			data = data[4:]
 		default:
-			var err error
-			switch wire {
-			case 0:
-				_, n, err := readProtoVarint(data)
-				if err == nil {
-					data = data[n:]
-				}
-			case 2:
-				data, err = skipProtoBytes(data)
-			default:
-				err = fmt.Errorf("unsupported wire type %d", wire)
-			}
-			if err != nil {
-				return mexcSpotKline{}, fmt.Errorf("skip wrapper field %d: %w", field, err)
-			}
+			return mexcSpotKline{}, fmt.Errorf("skip wrapper field %d: unsupported wire type %d", field, wire)
 		}
 	}
 	if len(klinePayload) == 0 {
