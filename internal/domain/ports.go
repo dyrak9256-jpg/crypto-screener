@@ -1,7 +1,5 @@
 package domain
 
-//go:generate mockgen -destination mocks/mock_ports.go -package mocks crypto-screener/internal/domain ExchangeConnector,FundingSink,TelegramSender,SignalRepository,UserRepository,CommandHandler,VolumeProvider
-
 import (
 	"context"
 	"time"
@@ -50,8 +48,4 @@ type UserRepository interface {
 
 type CommandHandler interface {
 	HandleCommand(chatID int64, username string, cmd string, args []string) string
-}
-
-type VolumeProvider interface {
-	GetSymbolVolume(symbol string, tf Timeframe, ts time.Time) decimal.Decimal
 }

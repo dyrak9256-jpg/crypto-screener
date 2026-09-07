@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,17 +39,18 @@ type Bot struct {
 	sendMu     sync.RWMutex
 	closed     atomic.Bool
 	commands   chan commandRequest
+	sendStop   chan struct{}
 }
 
 func NewBot(token string, handler domain.CommandHandler) (*Bot, error) {
 	if strings.TrimSpace(token) == "" {
 		return nil, fmt.Errorf("telegram token is empty")
 	}
-	api, err := tgbotapi.NewBotAPI(token)
+	api, err := tgbotapi.NewBotAPIWithClient(token, tgbotapi.APIEndpoint, &http.Client{Timeout: 15 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("init telegram bot: %w", err)
 	}
-	b := &Bot{api: api, cmdHandler: handler, sendChan: make(chan tgbotapi.Chattable, sendChanBuffer), commands: make(chan commandRequest, commandQueueBuffer)}
+	b := &Bot{api: api, cmdHandler: handler, sendChan: make(chan tgbotapi.Chattable, sendChanBuffer), commands: make(chan commandRequest, commandQueueBuffer), sendStop: make(chan struct{})}
 	b.sendWg.Add(1)
 	go b.sendWorker()
 	for i := 0; i < commandWorkers; i++ {
@@ -71,17 +73,44 @@ func (b *Bot) sendWorker() {
 	defer b.sendWg.Done()
 	ticker := time.NewTicker(sendInterval)
 	defer ticker.Stop()
-	for msg := range b.sendChan {
-		<-ticker.C
-		if _, err := b.api.Send(msg); err != nil {
-			if retry, ok := telegramRetryAfter(err); ok {
-				timer := time.NewTimer(retry)
-				<-timer.C
-				if _, retryErr := b.api.Send(msg); retryErr != nil {
-					log.Printf("⚠️ Telegram retry error: %v", retryErr)
+	for {
+		select {
+		case <-b.sendStop:
+			return
+		default:
+		}
+		select {
+		case <-b.sendStop:
+			return
+		case msg, ok := <-b.sendChan:
+			if !ok {
+				return
+			}
+			select {
+			case <-b.sendStop:
+				return
+			case <-ticker.C:
+			}
+			if _, err := b.api.Send(msg); err != nil {
+				if retry, ok := telegramRetryAfter(err); ok {
+					timer := time.NewTimer(retry)
+					select {
+					case <-b.sendStop:
+						if !timer.Stop() {
+							select {
+							case <-timer.C:
+							default:
+							}
+						}
+						return
+					case <-timer.C:
+					}
+					if _, retryErr := b.api.Send(msg); retryErr != nil {
+						log.Printf("⚠️ Telegram retry error: %v", retryErr)
+					}
+				} else {
+					log.Printf("⚠️ Telegram send error: %v", err)
 				}
-			} else {
-				log.Printf("⚠️ Telegram send error: %v", err)
 			}
 		}
 	}
@@ -142,6 +171,9 @@ func (b *Bot) Close() {
 		b.commandWg.Wait()
 		b.sendMu.Lock()
 		b.closed.Store(true)
+		if b.sendStop != nil {
+			close(b.sendStop)
+		}
 		if b.sendChan != nil {
 			close(b.sendChan)
 		}
@@ -155,7 +187,7 @@ func (b *Bot) StartPolling(ctx context.Context) error {
 		ctx = context.Background()
 	}
 	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
+	u.Timeout = 10
 	updates := b.api.GetUpdatesChan(u)
 	defer b.api.StopReceivingUpdates()
 	for {

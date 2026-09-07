@@ -8,32 +8,48 @@ import (
 	"time"
 )
 
-func TestVolumeEngineReplacesCurrentCandle(t *testing.T) {
+func TestVolumeEngine_ColdStartProjectsMinuteAverage(t *testing.T) {
 	v := NewVolumeEngine()
-	now := time.Now().UTC().Truncate(time.Minute)
-	require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeFutures, OpenTime: now, QuoteVolume: decimal.NewFromInt(100)}))
-	require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeFutures, OpenTime: now, QuoteVolume: decimal.NewFromInt(250)}))
-	require.True(t, v.GetMarketVolume("BINANCE", "BTCUSDT", domain.MarketTypeFutures, domain.TF_1m, now).Equal(decimal.NewFromInt(250)))
+	now := time.Date(2026, 9, 7, 4, 0, 0, 0, time.UTC)
+	v.clock = func() time.Time { return now }
+	for i := 0; i < 1; i++ {
+		require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeSpot, OpenTime: now.Add(-time.Duration(i) * time.Minute), QuoteVolume: decimal.RequireFromString("1666.666666")}))
+	}
+	est := v.EstimateMarketVolume("BINANCE", "BTCUSDT", domain.MarketTypeSpot, domain.TF_30m, now)
+	require.False(t, est.Complete)
+	require.Equal(t, 1, est.KnownMinutes)
+	require.InDelta(t, 50000, est.Volume.InexactFloat64(), 0.01)
+}
+func TestVolumeEngine_RepeatedCurrentCandleReplacesBucket(t *testing.T) {
+	v := NewVolumeEngine()
+	now := time.Date(2026, 9, 7, 4, 0, 0, 0, time.UTC)
+	v.clock = func() time.Time { return now }
+	c := domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeSpot, OpenTime: now, QuoteVolume: decimal.NewFromInt(1000)}
+	require.NoError(t, v.UpdateCandle(c))
+	c.QuoteVolume = decimal.NewFromInt(2500)
+	require.NoError(t, v.UpdateCandle(c))
+	require.True(t, v.GetMarketVolume("BINANCE", "BTCUSDT", domain.MarketTypeSpot, domain.TF_1m, now).Equal(decimal.NewFromInt(2500)))
+}
+func TestVolumeEngine_ZeroVolumeIsKnown(t *testing.T) {
+	v := NewVolumeEngine()
+	now := time.Date(2026, 9, 7, 4, 0, 0, 0, time.UTC)
+	v.clock = func() time.Time { return now }
+	require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeSpot, OpenTime: now, QuoteVolume: decimal.Zero}))
+	est := v.EstimateMarketVolume("BINANCE", "BTCUSDT", domain.MarketTypeSpot, domain.TF_1m, now)
+	require.True(t, est.Complete)
+	require.Equal(t, 1, est.KnownMinutes)
+	require.True(t, est.Volume.IsZero())
 }
 
-func TestVolumeEngineSumsMinutes(t *testing.T) {
+func TestVolumeEngine_ProjectionStopsAtGap(t *testing.T) {
 	v := NewVolumeEngine()
-	now := time.Now().UTC().Truncate(time.Minute)
-	for i := 0; i < 5; i++ {
-		require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeSpot, OpenTime: now.Add(time.Duration(-i) * time.Minute), QuoteVolume: decimal.NewFromInt(int64(100 + i))}))
+	now := time.Date(2026, 9, 7, 4, 0, 0, 0, time.UTC)
+	v.clock = func() time.Time { return now }
+	for _, offset := range []int{-1, -3} {
+		require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: "BINANCE", Symbol: "BTCUSDT", MarketType: domain.MarketTypeSpot, OpenTime: now.Add(time.Duration(offset) * time.Minute), QuoteVolume: decimal.NewFromInt(1000)}))
 	}
-	require.True(t, v.GetMarketVolume("BINANCE", "BTCUSDT", domain.MarketTypeSpot, domain.TF_5m, now).Equal(decimal.NewFromInt(510)))
-}
-
-func TestVolumeEngineRouteUsesWeakerLeg(t *testing.T) {
-	v := NewVolumeEngine()
-	now := time.Now().UTC().Truncate(time.Minute)
-	for _, x := range []struct {
-		ex string
-		m  domain.MarketType
-		q  int64
-	}{{"BINANCE", domain.MarketTypeSpot, 10000}, {"BYBIT", domain.MarketTypeFutures, 7000}} {
-		require.NoError(t, v.UpdateCandle(domain.MarketCandle{Exchange: x.ex, Symbol: "BTCUSDT", MarketType: x.m, OpenTime: now, QuoteVolume: decimal.NewFromInt(x.q)}))
-	}
-	require.True(t, v.GetRouteVolume("BINANCE", domain.MarketTypeSpot, "BYBIT", domain.MarketTypeFutures, "BTCUSDT", domain.TF_1m, now).Equal(decimal.NewFromInt(7000)))
+	est := v.EstimateMarketVolume("BINANCE", "BTCUSDT", domain.MarketTypeSpot, domain.TF_30m, now)
+	require.Equal(t, 0, est.KnownMinutes)
+	require.False(t, est.Complete)
+	require.True(t, est.Volume.IsZero())
 }

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -8,17 +10,12 @@ import (
 	"crypto-screener/internal/domain"
 )
 
-// Tracker ведёт активные сигналы и гарантирует последовательную обработку
-// событий одного ключа. Отправка в персистентность выполняется БЛОКИРУЮЩЕ и
-// ВНЕ мьютекса (никакой тихой потери сигналов). Уведомления — отслеживаемые
-// горутины (routerWg), чтобы graceful shutdown дождался их завершения.
 type Tracker struct {
 	mu            sync.Mutex
 	activeSignals map[string]*domain.ArbitrageSignal
 	config        *domain.ScreenerConfig
 	dbChan        chan<- *domain.ArbitrageSignal
 	router        *NotificationRouter
-	routerWg      *sync.WaitGroup
 }
 
 func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSignal, router *NotificationRouter) *Tracker {
@@ -99,8 +96,12 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 	t.mu.Unlock()
 
 	if persist != nil && t.dbChan != nil {
-		// Lifecycle/peak events are rare and must not be silently dropped.
-		t.dbChan <- persist
+		// Lifecycle/peak events are rare and must not be silently dropped. The
+		// bounded queue normally accepts immediately; a sustained DB outage is
+		// given a finite grace period so market-data workers are not blocked forever.
+		if err := t.enqueuePersistence(persist, 5*time.Second); err != nil {
+			log.Printf("❌ tracker persistence enqueue signal %s: %v", persist.ID, err)
+		}
 	}
 	if notify != nil && t.router != nil {
 		if opened {
@@ -123,4 +124,19 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 	}
 }
 
-func (t *Tracker) Stop(timeout time.Duration) error { _ = timeout; return nil }
+func (t *Tracker) enqueuePersistence(signal *domain.ArbitrageSignal, timeout time.Duration) error {
+	if signal == nil || t.dbChan == nil {
+		return nil
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case t.dbChan <- signal:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("database queue remained full for %s", timeout)
+	}
+}

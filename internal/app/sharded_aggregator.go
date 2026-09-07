@@ -4,6 +4,7 @@ import (
 	"hash/crc32"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto-screener/internal/domain"
@@ -15,18 +16,6 @@ const (
 	defaultPriceTTL = 5 * time.Second
 )
 
-// staleWindow — максимально допустимый возраст тика. Данные старше считаются
-// устаревшими и исключаются из расчёта (нельзя арбитражить по устаревшей цене).
-const staleWindow = 15 * time.Second
-
-// intervalVolumeTF — таймфрейм, по которому считается "интервальный" объём,
-// попадающий в SpreadEvent.QuoteVolume. Это НЕ 24h-rolling с биржи: объём
-// выводcтся из накопленных минутных дельт (см. getSymbolVolumeInternal).
-const intervalVolumeTF = domain.TF_5m
-
-// PriceState хранит ЛУЧШИЕ цены спроса/предложения отдельно для спота и фьючерсов.
-// Mid-price больше НЕ используется для исполняемого спреда: спред считается по
-// bid/ask-маршруту (купля по ask, продажа по bid).
 type PriceState struct {
 	Bid, Ask       decimal.Decimal
 	ReceivedAt     time.Time
@@ -53,6 +42,7 @@ type ShardedAggregator struct {
 	users       *domain.UserManager
 	volume      *VolumeEngine
 	priceTTL    time.Duration
+	ticks       atomic.Uint64
 }
 
 func NewShardedAggregator(trackerChan chan<- domain.SpreadEvent, funding *FundingManager, cfg *domain.ScreenerConfig, extras ...any) *ShardedAggregator {
@@ -76,7 +66,6 @@ func NewShardedAggregator(trackerChan chan<- domain.SpreadEvent, funding *Fundin
 			active: make(map[string]*routeState),
 		}
 	}
-	sa.staleWindow = staleWindow
 	return sa
 }
 
@@ -87,6 +76,15 @@ func shardFor(symbol string) int { return int(crc32.ChecksumIEEE([]byte(symbol))
 // Redundant quote updates are not persisted, which keeps DB traffic proportional to
 // actual arbitrage state changes rather than exchange ticker frequency.
 func (sa *ShardedAggregator) ProcessTick(tick domain.MarketTick) {
+	if sa.ticks.Add(1)%10000 == 0 {
+		if sa.funding != nil {
+			sa.funding.EvictStale()
+		}
+		if sa.volume != nil {
+			sa.volume.Janitor()
+		}
+		sa.Janitor()
+	}
 	if !validTick(tick) {
 		return
 	}
@@ -105,6 +103,7 @@ func (sa *ShardedAggregator) ProcessTick(tick domain.MarketTick) {
 		tick.Timestamp = tick.EventTime
 	}
 
+	hasUsers := sa.users == nil || sa.users.HasUsers()
 	shard := sa.shards[shardFor(tick.Symbol)]
 	shard.mu.Lock()
 	byExchange := shard.prices[tick.Symbol]
@@ -133,7 +132,7 @@ func (sa *ShardedAggregator) ProcessTick(tick domain.MarketTick) {
 
 	var events []domain.SpreadEvent
 	currentKeys := make(map[string]struct{}, 2)
-	if sa.config.IsPairEnabled(tick.Symbol) {
+	if hasUsers && sa.config.IsPairEnabled(tick.Symbol) && sa.symbolMayPassVolume(byExchange, tick.Symbol, now) {
 		for _, ev := range sa.crossCandidates(byExchange, tick.Symbol, now) {
 			if sa.routeVolumeEligible(ev) {
 				if event, emit := sa.observe(shard, ev, currentKeys); emit {
@@ -239,11 +238,20 @@ func (sa *ShardedAggregator) crossCandidates(byExchange map[string]map[domain.Ma
 			if !spread.IsPositive() {
 				continue
 			}
+			if sa.funding == nil {
+				continue
+			}
+			fund := sa.funding.EvaluateFuturesPair(buyEx, symbol, sellEx, symbol, spread, now)
+			if !fund.Profitable {
+				continue
+			}
 			events = append(events, domain.SpreadEvent{
-				Symbol: symbol, SpreadType: domain.CrossExchange, Spread: spread,
+				Symbol: symbol, SpreadType: domain.CrossExchange, Spread: fund.NetSpread,
 				BuyExchange: buyEx, SellExchange: sellEx,
 				BuyMarket: domain.MarketTypeFutures, SellMarket: domain.MarketTypeFutures,
-				BuyAsk: buyAsk, SellBid: sellBid, QuoteVolume: minDecimal(buyVol, sellVol), Timestamp: now,
+				BuyAsk: buyAsk, SellBid: sellBid, QuoteVolume: minDecimal(buyVol, sellVol),
+				BuyFundingRate: fund.BuyFundingRate, SellFundingRate: fund.SellFundingRate,
+				BuyNextFunding: fund.BuyNextFundingTime, SellNextFunding: fund.SellNextFundingTime, Timestamp: now,
 			})
 		}
 	}
@@ -259,38 +267,24 @@ func (sa *ShardedAggregator) intraCandidate(byExchange map[string]map[domain.Mar
 	if !fresh(spot, now, sa.priceTTL) || !fresh(fut, now, sa.priceTTL) {
 		return domain.SpreadEvent{}, false
 	}
-	var spread, buyAsk, sellBid decimal.Decimal
-	var direction ArbDirection
-	if fut.Bid.GreaterThan(spot.Ask) {
-		spread = fut.Bid.Sub(spot.Ask).Div(spot.Ask)
-		direction, buyAsk, sellBid = SpotLongFuturesShort, spot.Ask, fut.Bid
-	} else if spot.Bid.GreaterThan(fut.Ask) {
-		spread = spot.Bid.Sub(fut.Ask).Div(fut.Ask)
-		direction, buyAsk, sellBid = SpotShortFuturesLong, fut.Ask, spot.Bid
-	} else {
+	// Spot is long-only in this screener. We never generate spot-short/futures-long routes.
+	if !fut.Bid.GreaterThan(spot.Ask) {
 		return domain.SpreadEvent{}, false
 	}
-	if spread.IsNegative() || spread.IsZero() {
+	spread := fut.Bid.Sub(spot.Ask).Div(spot.Ask)
+	if !spread.IsPositive() || sa.funding == nil {
 		return domain.SpreadEvent{}, false
 	}
-
-	result := ArbResult{Profitable: true, NetSpread: spread, Reason: ReasonProfitable}
-	if sa.funding != nil {
-		result = sa.funding.EvaluateArb(exchange, symbol, spread, direction, now)
-		if !result.Profitable {
-			// Funding is optional. The FundingManager only blocks this route when
-			// RequireFunding=true; otherwise a missing/stale funding feed does not
-			// disable spot/futures detection on an otherwise healthy exchange.
-			return domain.SpreadEvent{}, false
-		}
+	result := sa.funding.EvaluateSpotFutures(exchange, symbol, spread, now)
+	if !result.Profitable {
+		return domain.SpreadEvent{}, false
 	}
 	return domain.SpreadEvent{
 		Symbol: symbol, SpreadType: domain.IntraExchange, Spread: result.NetSpread,
-		BuyExchange: exchange, SellExchange: exchange,
-		BuyMarket: domain.MarketTypeSpot, SellMarket: domain.MarketTypeFutures,
-		BuyAsk: buyAsk, SellBid: sellBid,
-		QuoteVolume: minDecimal(spot.QuoteVolume24h, fut.QuoteVolume24h),
-		FundingRate: result.FundingRate, NextFunding: result.NextFundingTime, Timestamp: now,
+		BuyExchange: exchange, SellExchange: exchange, BuyMarket: domain.MarketTypeSpot, SellMarket: domain.MarketTypeFutures,
+		BuyAsk: spot.Ask, SellBid: fut.Bid, QuoteVolume: minDecimal(spot.QuoteVolume24h, fut.QuoteVolume24h),
+		BuyFundingRate: result.BuyFundingRate, SellFundingRate: result.SellFundingRate,
+		BuyNextFunding: result.BuyNextFundingTime, SellNextFunding: result.SellNextFundingTime, Timestamp: now,
 	}, true
 }
 
@@ -324,15 +318,56 @@ func (sa *ShardedAggregator) observe(shard *Shard, ev domain.SpreadEvent, curren
 	return domain.SpreadEvent{}, false
 }
 
+func (sa *ShardedAggregator) symbolMayPassVolume(byExchange map[string]map[domain.MarketType]*PriceState, symbol string, now time.Time) bool {
+	if sa.users == nil {
+		return true
+	}
+	// This is a conservative upper-bound prefilter. It never rejects a route
+	// merely because the selected pair has not been built yet: if any current
+	// leg can satisfy a user's minimum, the expensive O(E²) route search runs.
+	eligible := false
+	sa.users.Range(func(u domain.User) bool {
+		if u.MinVolume.IsZero() {
+			eligible = true
+			return false
+		}
+		var maxVolume decimal.Decimal
+		if u.Timeframe == domain.TF_24h {
+			for _, markets := range byExchange {
+				for _, state := range markets {
+					if state != nil && fresh(state, now, sa.priceTTL) && state.QuoteVolume24h.GreaterThan(maxVolume) {
+						maxVolume = state.QuoteVolume24h
+					}
+				}
+			}
+		} else if sa.volume != nil {
+			for exchange, markets := range byExchange {
+				for market, state := range markets {
+					if state == nil || !fresh(state, now, sa.priceTTL) {
+						continue
+					}
+					est := sa.volume.EstimateMarketVolume(exchange, symbol, market, u.Timeframe, now)
+					if est.Volume.GreaterThan(maxVolume) {
+						maxVolume = est.Volume
+					}
+				}
+			}
+		}
+		if maxVolume.GreaterThanOrEqual(u.MinVolume) {
+			eligible = true
+			return false
+		}
+		return true
+	})
+	return eligible
+}
+
 func (sa *ShardedAggregator) routeVolumeEligible(ev domain.SpreadEvent) bool {
 	if sa.users == nil {
 		return true
 	}
 	eligible := false
 	sa.users.Range(func(u domain.User) bool {
-		if u.MinVolume.IsNegative() {
-			return true
-		}
 		var volume decimal.Decimal
 		if u.Timeframe == domain.TF_24h {
 			volume = ev.QuoteVolume
@@ -342,6 +377,15 @@ func (sa *ShardedAggregator) routeVolumeEligible(ev domain.SpreadEvent) bool {
 		if volume.GreaterThanOrEqual(u.MinVolume) {
 			eligible = true
 			return false
+		}
+		// Incomplete windows use a projected average-minute volume. This is only a
+		// prefilter; the exact user check is repeated by NotificationRouter.
+		if u.Timeframe != domain.TF_24h && sa.volume != nil {
+			est := sa.volume.GetRouteVolumeEstimate(ev.BuyExchange, ev.BuyMarket, ev.SellExchange, ev.SellMarket, ev.Symbol, u.Timeframe, ev.Timestamp)
+			if est.Volume.GreaterThanOrEqual(u.MinVolume) {
+				eligible = true
+				return false
+			}
 		}
 		return true
 	})
@@ -384,38 +428,35 @@ func validTick(t domain.MarketTick) bool {
 	return !t.ReceivedAt.IsZero() || !t.EventTime.IsZero() || !t.Timestamp.IsZero()
 }
 func minDecimal(a, b decimal.Decimal) decimal.Decimal {
-	if a.IsZero() {
-		return b
-	}
-	if b.IsZero() {
-		return a
-	}
 	if a.LessThan(b) {
 		return a
 	}
 	return b
 }
-func (sa *ShardedAggregator) GetSymbolVolume(symbol string, tf domain.Timeframe, ts time.Time) decimal.Decimal {
-	// Only 24h rolling quote volume is available from the ticker adapters. A
-	// timeframe-specific volume must be built from trades/klines and is not
-	// fabricated here.
-	if tf != domain.TF_24h {
-		return decimal.Zero
-	}
-	shard := sa.shards[shardFor(normalizeSymbol(symbol))]
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-	byExchange := shard.prices[normalizeSymbol(symbol)]
-	var max decimal.Decimal
-	for _, markets := range byExchange {
-		for _, st := range markets {
-			if st != nil && (ts.IsZero() || st.ReceivedAt.After(ts.Add(-sa.priceTTL))) && st.QuoteVolume24h.GreaterThan(max) {
-				max = st.QuoteVolume24h
+func (sa *ShardedAggregator) Janitor() {
+	now := time.Now()
+	cut := now.Add(-sa.priceTTL * 12)
+	for _, shard := range sa.shards {
+		shard.mu.Lock()
+		for symbol, byEx := range shard.prices {
+			for ex, markets := range byEx {
+				for market, st := range markets {
+					if st == nil || st.ReceivedAt.Before(cut) {
+						delete(markets, market)
+					}
+				}
+				if len(markets) == 0 {
+					delete(byEx, ex)
+				}
+			}
+			if len(byEx) == 0 {
+				delete(shard.prices, symbol)
 			}
 		}
+		shard.mu.Unlock()
 	}
-	return max
 }
+
 func (sa *ShardedAggregator) sendEvent(event domain.SpreadEvent) {
 	if sa.trackerChan == nil {
 		return

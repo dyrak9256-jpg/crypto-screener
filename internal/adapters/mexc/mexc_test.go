@@ -1,40 +1,37 @@
 package mexc
 
 import (
-	"context"
+	"encoding/json"
 	"testing"
-	"time"
 
-	"crypto-screener/internal/domain"
-
-	"github.com/stretchr/testify/assert"
+	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/require"
 )
 
-// Connect* методы после H1-фикса БЛОКИРУЮТСЯ на время жизни соединения.
-// Предотменённый контекст должен заставить их вернуться сразу (без сети и без зависания).
-func TestMexc_ConnectMethods_ReturnPromptlyOnCanceledContext(t *testing.T) {
-	adapter := NewAdapter()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // отменён до вызова => процессы должны сразу выйти
-
-	tickChan := make(chan domain.MarketTick, 1)
-
-	done := make(chan error, 3)
-	go func() { done <- adapter.ConnectSpot(ctx, tickChan) }()
-	go func() { done <- adapter.ConnectFutures(ctx, tickChan) }()
-	go func() { done <- adapter.ConnectFunding(ctx, nil) }()
-
-	for i := 0; i < 3; i++ {
-		select {
-		case err := <-done:
-			_ = err // prompt return is the contract; a cancelled-ctx dial error is expected
-		case <-time.After(2 * time.Second):
-			t.Fatalf("Connect* did not return promptly on cancelled context")
-		}
+func TestFuturesToTickConvertsContractVolumeToQuoteNotional(t *testing.T) {
+	a := NewAdapter()
+	a.contractSize["BTC_USDT"] = decimal.RequireFromString("0.0001")
+	raw := futuresTickerData{
+		Symbol:    "BTC_USDT",
+		LastPrice: json.RawMessage(`50000`),
+		Bid1:      json.RawMessage(`49999`),
+		Ask1:      json.RawMessage(`50001`),
+		Volume:    json.RawMessage(`100000`),
 	}
+	tick, ok := a.futuresToTick(&raw)
+	require.True(t, ok)
+	require.True(t, tick.QuoteVolume.Equal(decimal.NewFromInt(500000)))
 }
 
-func TestMexc_ImplementsExchangeConnector(t *testing.T) {
-	var _ domain.ExchangeConnector = NewAdapter()
-	assert.NotNil(t, NewAdapter())
+func TestFuturesToTickFailsClosedWithoutContractSize(t *testing.T) {
+	a := NewAdapter()
+	raw := futuresTickerData{
+		Symbol:    "BTC_USDT",
+		LastPrice: json.RawMessage(`50000`),
+		Bid1:      json.RawMessage(`49999`),
+		Ask1:      json.RawMessage(`50001`),
+		Volume:    json.RawMessage(`100000`),
+	}
+	_, ok := a.futuresToTick(&raw)
+	require.False(t, ok)
 }

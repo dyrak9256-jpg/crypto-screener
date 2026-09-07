@@ -15,8 +15,10 @@ CREATE TABLE IF NOT EXISTS signals (
     peak_spread NUMERIC(20, 8) NOT NULL,
     final_spread NUMERIC(20, 8),
     quote_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
-    funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0,
-    next_funding_at TIMESTAMPTZ,
+    buy_funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0,
+    sell_funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0,
+    buy_next_funding_at TIMESTAMPTZ,
+    sell_next_funding_at TIMESTAMPTZ,
     duration_ms BIGINT
 );
 
@@ -24,7 +26,7 @@ CREATE TABLE IF NOT EXISTS users (
     chat_id BIGINT PRIMARY KEY,
     username VARCHAR(100),
     min_spread NUMERIC(20, 8) NOT NULL DEFAULT 0.01,
-    min_volume NUMERIC(30, 8) NOT NULL DEFAULT 1000000,
+    min_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
     timeframe VARCHAR(10) NOT NULL DEFAULT '15m',
     min_funding_minutes INTEGER NOT NULL DEFAULT 30,
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -42,5 +44,7 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_exchange VARCHAR(50) NOT NULL 
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS buy_market VARCHAR(20) NOT NULL DEFAULT '';
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_market VARCHAR(20) NOT NULL DEFAULT '';
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS quote_volume NUMERIC(30, 8) NOT NULL DEFAULT 0;
-ALTER TABLE signals ADD COLUMN IF NOT EXISTS funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0;
-ALTER TABLE signals ADD COLUMN IF NOT EXISTS next_funding_at TIMESTAMPTZ;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS buy_funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS buy_next_funding_at TIMESTAMPTZ;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_next_funding_at TIMESTAMPTZ;

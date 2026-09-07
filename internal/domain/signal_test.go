@@ -69,12 +69,8 @@ func TestScreenerConfig_Getters(t *testing.T) {
 	t.Parallel()
 
 	hardSpread := decimal.RequireFromString("0.015")
-	hardVol := decimal.RequireFromString("500000")
-	cfg := NewScreenerConfig(hardSpread, hardVol)
+	cfg := NewScreenerConfig(hardSpread)
 
 	assert.True(t, cfg.GetHardMinSpread().Equal(hardSpread))
-	assert.True(t, cfg.GetHardMinVolume().Equal(hardVol))
-	assert.Equal(t, 30, cfg.GetFundingTimeBuffer())
-	assert.True(t, cfg.IsPairEnabled("BTCUSDT"))
-	assert.True(t, cfg.IsPairEnabled("ETHUSDT"))
+	assert.True(t, cfg.GetEffectiveIntraSpread().Equal(hardSpread))
 }

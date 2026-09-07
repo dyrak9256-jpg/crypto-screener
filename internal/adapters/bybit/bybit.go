@@ -3,13 +3,19 @@ package bybit
 import (
 	"context"
 	"crypto-screener/internal/domain"
+	"crypto-screener/internal/ingress"
+	"crypto-screener/internal/retry"
+	"crypto-screener/internal/wsutil"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -57,20 +63,23 @@ type pongResponse struct {
 }
 
 type tickerPayload struct {
-	Symbol   string `json:"symbol"`
-	Bid1     string `json:"bid1Price"`
-	Ask1     string `json:"ask1Price"`
-	TurnOver string `json:"turnover24h"`
+	Symbol          string `json:"symbol"`
+	Bid1            string `json:"bid1Price"`
+	Ask1            string `json:"ask1Price"`
+	TurnOver        string `json:"turnover24h"`
+	FundingRate     string `json:"fundingRate"`
+	NextFundingTime string `json:"nextFundingTime"`
 }
 
 type Adapter struct {
-	client *http.Client
+	client       *http.Client
+	fundingSink  atomic.Value
+	fundingReady chan struct{}
+	fundingOnce  sync.Once
 }
 
 func NewAdapter() *Adapter {
-	return &Adapter{
-		client: &http.Client{Timeout: 15 * time.Second},
-	}
+	return &Adapter{client: &http.Client{Timeout: 15 * time.Second}, fundingReady: make(chan struct{})}
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
@@ -79,7 +88,21 @@ func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick)
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
+	select {
+	case <-a.fundingReady:
+	case <-ctx.Done():
+		return nil
+	}
 	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
+	return nil
+}
+func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
+	if sink == nil {
+		return fmt.Errorf("Bybit funding sink is nil")
+	}
+	a.fundingSink.Store(sink)
+	a.fundingOnce.Do(func() { close(a.fundingReady) })
+	<-ctx.Done()
 	return nil
 }
 
@@ -89,7 +112,9 @@ func (a *Adapter) listen(
 	mType domain.MarketType,
 	out chan<- domain.MarketTick,
 ) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for {
+		startedAt := time.Now()
 		if ctx.Err() != nil {
 			return
 		}
@@ -99,49 +124,98 @@ func (a *Adapter) listen(
 			}
 			log.Printf("⚠️  Bybit %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
 		}
-		select {
-		case <-ctx.Done():
+		if time.Since(startedAt) >= 30*time.Second {
+			backoff.Reset()
+		}
+		if !backoff.Wait(ctx.Done()) {
 			return
-		case <-time.After(reconnectDelay):
 		}
 	}
 }
 
 func (a *Adapter) connectAndRead(
 	ctx context.Context,
-	url string,
+	wsURL string,
 	mType domain.MarketType,
 	out chan<- domain.MarketTick,
 ) error {
-	conn, _, err := dialer.DialContext(ctx, url, nil)
-	if err != nil {
-		return fmt.Errorf("dial: %w", err)
-	}
-	conn.SetReadLimit(1 << 20)
-	defer conn.Close()
-
-	log.Printf("✅ Bybit %s connected", mType)
-
-	// Получаем символы через REST для подписки
 	restURL := futuresSymbolsURL
 	if mType == domain.MarketTypeSpot {
 		restURL = spotSymbolsURL
 	}
-
 	symbols, err := a.fetchSymbols(ctx, restURL)
 	if err != nil {
-		return fmt.Errorf("fetch symbols: %w", err)
+		return fmt.Errorf("fetch symbols for %s: %w", mType, err)
 	}
-
-	log.Printf("📋 Bybit %s: subscribing to %d symbols", mType, len(symbols))
-
-	// Формируем топики
 	args := make([]string, 0, len(symbols))
-	for _, s := range symbols {
-		args = append(args, "tickers."+s)
+	for _, symbol := range symbols {
+		args = append(args, "tickers."+symbol)
 	}
+	shards := shardArgs(args, 16000)
+	if len(shards) == 0 {
+		return fmt.Errorf("no %s ticker subscriptions", mType)
+	}
+	log.Printf("📋 Bybit %s: %d symbols across %d connections", mType, len(symbols), len(shards))
 
-	// Отправляем подписку батчами по 50
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, len(shards))
+	var wg sync.WaitGroup
+	for _, shard := range shards {
+		shard := append([]string(nil), shard...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := a.readTickerShard(connCtx, wsURL, mType, shard, out); err != nil && connCtx.Err() == nil {
+				errCh <- err
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if mType == domain.MarketTypeFutures {
+			if v := a.fundingSink.Load(); v != nil {
+				v.(domain.FundingSink).SetStreamHealth("BYBIT", false)
+			}
+		}
+		return fmt.Errorf("connectAndRead: %w", err)
+	}
+	return nil
+}
+
+func shardArgs(args []string, maxChars int) [][]string {
+	if maxChars <= 0 {
+		maxChars = 16000
+	}
+	var shards [][]string
+	current := make([]string, 0, 64)
+	currentSize := 0
+	for _, arg := range args {
+		extra := len(arg) + 3 // quotes, comma and JSON framing overhead
+		if len(current) > 0 && currentSize+extra > maxChars {
+			shards = append(shards, current)
+			current = make([]string, 0, 64)
+			currentSize = 0
+		}
+		current = append(current, arg)
+		currentSize += extra
+	}
+	if len(current) > 0 {
+		shards = append(shards, current)
+	}
+	return shards
+}
+
+func (a *Adapter) readTickerShard(ctx context.Context, wsURL string, mType domain.MarketType, args []string, out chan<- domain.MarketTick) error {
+	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("dial ticker shard: %w", err)
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+
 	batchSize := futuresSubBatchSize
 	if mType == domain.MarketTypeSpot {
 		batchSize = spotSubBatchSize
@@ -151,67 +225,48 @@ func (a *Adapter) connectAndRead(
 		if end > len(args) {
 			end = len(args)
 		}
-		sub := subscribeMsg{Op: "subscribe", Args: args[i:end]}
-		if err := conn.WriteJSON(sub); err != nil {
-			return fmt.Errorf("subscribe batch [%d:%d]: %w", i, end, err)
+		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
+			return fmt.Errorf("subscribe ticker batch [%d:%d]: %w", i, end, err)
 		}
 	}
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	go closeOnCtx(connCtx, conn)
-
-	// ✅ НЕ ставим SetPongHandler — Bybit шлёт JSON pong через ReadMessage
-	// Дедлайн сбрасываем при каждом сообщении в цикле
 	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
+		return fmt.Errorf("set ticker read deadline: %w", err)
 	}
-
 	go bybitKeepAlive(connCtx, conn)
 
-	// ✅ Локальный кэш: накладываем delta на snapshot
-	cache := make(map[string]*tickerPayload, len(symbols))
-
+	cache := make(map[string]*tickerPayload, len(args))
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("read: %w", err)
+			return fmt.Errorf("read ticker shard: %w", err)
 		}
-
-		// Сбрасываем дедлайн при любом входящем сообщении (включая pong)
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+			return fmt.Errorf("refresh ticker read deadline: %w", err)
+		}
 
 		var resp wsResponse
 		if err := sonic.Unmarshal(msg, &resp); err != nil {
 			continue
 		}
-
-		// Пропускаем служебные сообщения: pong, ack подписки
 		if resp.Topic == "" {
 			continue
 		}
-
 		var delta tickerPayload
-		if err := sonic.Unmarshal(resp.Data, &delta); err != nil {
+		if err := sonic.Unmarshal(resp.Data, &delta); err != nil || delta.Symbol == "" {
 			continue
 		}
-
-		if delta.Symbol == "" {
-			continue
-		}
-
-		// ✅ Merge delta в кэш
-		current, exists := cache[delta.Symbol]
-		if !exists {
+		current := cache[delta.Symbol]
+		if current == nil {
 			current = &tickerPayload{Symbol: delta.Symbol}
 			cache[delta.Symbol] = current
 		}
-
-		// Обновляем только непустые поля (delta может содержать только часть)
 		if delta.Bid1 != "" {
 			current.Bid1 = delta.Bid1
 		}
@@ -221,42 +276,54 @@ func (a *Adapter) connectAndRead(
 		if delta.TurnOver != "" {
 			current.TurnOver = delta.TurnOver
 		}
+		if delta.FundingRate != "" {
+			current.FundingRate = delta.FundingRate
+		}
+		if delta.NextFundingTime != "" {
+			current.NextFundingTime = delta.NextFundingTime
+		}
 
-		// После первого snapshot у нас есть оба значения
 		eventTime := time.Now()
 		if resp.Ts > 0 {
 			eventTime = time.UnixMilli(resp.Ts)
+		}
+		if mType == domain.MarketTypeFutures && current.FundingRate != "" {
+			if rate, parseErr := decimal.NewFromString(current.FundingRate); parseErr == nil {
+				var next time.Time
+				if ms, parseErr := strconv.ParseInt(current.NextFundingTime, 10, 64); parseErr == nil && ms > 0 {
+					next = time.UnixMilli(ms)
+				}
+				if v := a.fundingSink.Load(); v != nil {
+					if err := v.(domain.FundingSink).UpdateFunding("BYBIT", current.Symbol, rate, next, eventTime); err != nil {
+						return fmt.Errorf("update Bybit funding for %s: %w", current.Symbol, err)
+					}
+				}
+			}
 		}
 		tick, ok := toMarketTick(current, mType, eventTime)
 		if !ok {
 			continue
 		}
-
-		select {
-		case out <- tick:
-		case <-connCtx.Done():
-			return nil
-		default:
-		}
+		ingress.Submit(out, tick)
 	}
 }
 
 // fetchSymbols получает список торгующихся символов через REST
-func (a *Adapter) fetchSymbols(ctx context.Context, url string) ([]string, error) {
+func (a *Adapter) fetchSymbols(ctx context.Context, endpoint string) ([]string, error) {
 	var symbols []string
 	cursor := ""
 	for {
-		reqURL := url
+		reqURL := endpoint
 		if cursor != "" {
 			reqURL += "&cursor=" + url.QueryEscape(cursor)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetchSymbols: %w", err)
 		}
 		resp, err := a.client.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetchSymbols: %w", err)
 		}
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -284,9 +351,15 @@ func (a *Adapter) fetchSymbols(ctx context.Context, url string) ([]string, error
 			return nil, fmt.Errorf("bybit API error %d: %s", parsed.RetCode, parsed.RetMsg)
 		}
 		for _, item := range parsed.Result.List {
-			if item.Status == "Trading" {
-				symbols = append(symbols, item.Symbol)
+			if item.Status != "Trading" {
+				continue
 			}
+			if strings.Contains(endpoint, "category=spot") || strings.Contains(endpoint, "category=linear") {
+				if !strings.HasSuffix(item.Symbol, "USDT") {
+					continue
+				}
+			}
+			symbols = append(symbols, item.Symbol)
 		}
 		if parsed.Result.NextPageCursor == "" || parsed.Result.NextPageCursor == cursor {
 			break
@@ -299,6 +372,22 @@ func (a *Adapter) fetchSymbols(ctx context.Context, url string) ([]string, error
 // ConnectCandles subscribes only to 1-minute klines. Higher timeframes are
 // calculated locally from these minute buckets, so the exchange sends no
 // duplicate 5m/15m/30m streams.
+func bybitKeepAlive(ctx context.Context, conn *websocket.Conn) {
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := conn.WriteJSON(pingMsg{Op: "ping"}); err != nil {
+				log.Printf("⚠️  %v", fmt.Errorf("Bybit keepalive: %w", err))
+				return
+			}
+		}
+	}
+}
+
 func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
 	for _, market := range []domain.MarketType{domain.MarketTypeSpot, domain.MarketTypeFutures} {
 		go a.runCandleFeed(ctx, sink, market)
@@ -308,9 +397,13 @@ func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) er
 }
 
 type bybitCandleResponse struct {
-	Topic string `json:"topic"`
-	Ts    int64  `json:"ts"`
-	Data  []struct {
+	Op      string `json:"op"`
+	Success bool   `json:"success"`
+	RetCode int    `json:"retCode"`
+	RetMsg  string `json:"retMsg"`
+	Topic   string `json:"topic"`
+	Ts      int64  `json:"ts"`
+	Data    []struct {
 		Start     int64  `json:"start"`
 		End       int64  `json:"end"`
 		Turnover  string `json:"turnover"`
@@ -328,6 +421,7 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, mar
 		rest = spotSymbolsURL
 		batch = spotSubBatchSize
 	}
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for ctx.Err() == nil {
 		symbols, err := a.fetchSymbols(ctx, rest)
 		if err != nil {
@@ -335,35 +429,68 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, mar
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(reconnectDelay):
+			case <-retry.After(reconnectDelay):
 			}
 			continue
 		}
 		if err := a.readCandleShard(ctx, sink, url, symbols, market, batch); err != nil && ctx.Err() == nil {
 			log.Printf("⚠️ Bybit %s candle WS: %v", market, err)
 		}
+		if ctx.Err() == nil && !backoff.Wait(ctx.Done()) {
+			return
+		}
 	}
 }
 
 func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, url string, symbols []string, market domain.MarketType, batch int) error {
-	conn, _, err := dialer.DialContext(ctx, url, nil)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	conn.SetReadLimit(1 << 20)
-	go closeOnCtx(ctx, conn)
 	args := make([]string, 0, len(symbols))
 	for _, s := range symbols {
 		args = append(args, "kline.1."+s)
 	}
+	shards := shardArgs(args, 16000)
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errCh := make(chan error, len(shards))
+	var wg sync.WaitGroup
+	for _, shard := range shards {
+		shard := append([]string(nil), shard...)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := a.readCandleConnection(connCtx, sink, url, shard, market, batch); err != nil && connCtx.Err() == nil {
+				errCh <- err
+				cancel()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return fmt.Errorf("readCandleShard: %w", err)
+	}
+	return nil
+}
+
+func (a *Adapter) readCandleConnection(ctx context.Context, sink domain.CandleSink, url string, args []string, market domain.MarketType, batch int) error {
+	conn, _, err := dialer.DialContext(ctx, url, nil)
+	if err != nil {
+		return fmt.Errorf("dial candle shard: %w", err)
+	}
+	defer conn.Close()
+	conn.SetReadLimit(1 << 20)
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := wsutil.StartHeartbeat(connCtx, conn, 20*time.Second, 60*time.Second); err != nil {
+		return fmt.Errorf("start websocket heartbeat: %w", err)
+	}
+	go closeOnCtx(connCtx, conn)
 	for i := 0; i < len(args); i += batch {
 		end := i + batch
 		if end > len(args) {
 			end = len(args)
 		}
 		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
-			return err
+			return fmt.Errorf("subscribe candle batch [%d:%d]: %w", i, end, err)
 		}
 	}
 	for {
@@ -372,10 +499,25 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, u
 			if ctx.Err() != nil {
 				return nil
 			}
-			return err
+			return fmt.Errorf("read candle shard: %w", err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(60 * time.Second)); err != nil {
+			return fmt.Errorf("refresh candle read deadline: %w", err)
 		}
 		var r bybitCandleResponse
-		if sonic.Unmarshal(msg, &r) != nil || len(r.Data) == 0 || r.Topic == "" {
+		if err := sonic.Unmarshal(msg, &r); err != nil {
+			continue
+		}
+		if r.Op == "subscribe" {
+			if r.RetCode != 0 || !r.Success {
+				return fmt.Errorf("Bybit candle subscription rejected: code=%d msg=%q", r.RetCode, r.RetMsg)
+			}
+			continue
+		}
+		if r.RetCode != 0 {
+			return fmt.Errorf("Bybit candle websocket error: code=%d msg=%q", r.RetCode, r.RetMsg)
+		}
+		if len(r.Data) == 0 || r.Topic == "" {
 			continue
 		}
 		parts := strings.Split(r.Topic, ".")
@@ -385,14 +527,16 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, u
 		symbol := parts[2]
 		for _, d := range r.Data {
 			q, err := decimal.NewFromString(d.Turnover)
-			if err != nil || !q.IsPositive() {
+			if err != nil || q.IsNegative() {
 				continue
 			}
 			et := time.UnixMilli(d.Timestamp)
 			if d.Timestamp == 0 {
 				et = time.UnixMilli(r.Ts)
 			}
-			sink.UpdateCandle(domain.MarketCandle{Exchange: "BYBIT", Symbol: symbol, MarketType: market, OpenTime: time.UnixMilli(d.Start), CloseTime: time.UnixMilli(d.End), QuoteVolume: q, EventTime: et, Closed: d.Confirm})
+			if err := sink.UpdateCandle(domain.MarketCandle{Exchange: "BYBIT", Symbol: symbol, MarketType: market, OpenTime: time.UnixMilli(d.Start), CloseTime: time.UnixMilli(d.End), QuoteVolume: q, EventTime: et, Closed: d.Confirm}); err != nil {
+				return fmt.Errorf("update Bybit candle %s: %w", symbol, err)
+			}
 		}
 	}
 }

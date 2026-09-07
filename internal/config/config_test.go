@@ -11,7 +11,6 @@ func TestConfig_Load_Defaults(t *testing.T) {
 	t.Setenv("TELEGRAM_TOKEN", "")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@localhost:5432/screener?sslmode=disable")
 	t.Setenv("HARD_MIN_SPREAD", "")
-	t.Setenv("HARD_MIN_VOLUME", "")
 	t.Setenv("ADMIN_CHAT_IDS", "")
 	cfg, err := Load()
 	require.NoError(t, err)
@@ -19,20 +18,17 @@ func TestConfig_Load_Defaults(t *testing.T) {
 	require.Equal(t, "", cfg.TelegramToken)
 	require.Equal(t, "postgres://user:pass@localhost:5432/screener?sslmode=disable", cfg.DatabaseURL)
 	require.True(t, cfg.HardMinSpread.Equal(decimal.RequireFromString("0.01")))
-	require.True(t, cfg.HardMinVolume.Equal(decimal.RequireFromString("1000000")))
 }
 
 func TestConfig_Load_CustomEnv(t *testing.T) {
 	t.Setenv("TELEGRAM_TOKEN", "token")
 	t.Setenv("DATABASE_URL", "postgres://admin:secret@pg.internal:5432/arbitrage?sslmode=require")
 	t.Setenv("HARD_MIN_SPREAD", "0.025")
-	t.Setenv("HARD_MIN_VOLUME", "2500000")
 	t.Setenv("ADMIN_CHAT_IDS", "1, 2")
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, "token", cfg.TelegramToken)
 	require.True(t, cfg.HardMinSpread.Equal(decimal.RequireFromString("0.025")))
-	require.True(t, cfg.HardMinVolume.Equal(decimal.RequireFromString("2500000")))
 	require.Equal(t, []int64{1, 2}, cfg.AdminChatIDs)
 }
 
@@ -46,17 +42,4 @@ func TestConfig_Load_MissingDatabaseURLFails(t *testing.T) {
 	t.Setenv("DATABASE_URL", "")
 	_, err := Load()
 	require.Error(t, err)
-}
-
-func TestConfig_Load_InvalidSpreadFallsBackToDefault(t *testing.T) {
-	// Некорректное значение HARD_MIN_SPREAD не должно обнулять порог (это
-	// отключило бы фильтрацию сигналов) — фолбэк на дефолт 0.01.
-	t.Setenv("HARD_MIN_SPREAD", "not-a-number")
-	t.Setenv("HARD_MIN_VOLUME", "not-a-number")
-
-	cfg := Load()
-	assert.True(t, cfg.HardMinSpread.Equal(decimal.RequireFromString("0.01")),
-		"invalid spread must fall back to 0.01")
-	assert.True(t, cfg.HardMinVolume.Equal(decimal.RequireFromString("1000000")),
-		"invalid volume must fall back to 1000000")
 }

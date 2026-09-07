@@ -33,24 +33,23 @@ func TestBinanceAdapter_ConnectAndRead_TickerStream(t *testing.T) {
 		}
 		defer conn.Close()
 
-		// 1. Send valid ticker payload.
-		// Для `!ticker@arr` сервер шлёт МАССИВ тикеров; адаптер ожидает слайс.
-		validMsg := []tickerPayload{{
+		// 1. Send valid ticker payload
+		validMsg := tickerPayload{
 			Symbol:  "BTCUSDT",
 			BestBid: "65000.50",
 			BestAsk: "65001.50",
 			QVolume: "1234567.89",
-		}}
+		}
 		bytes, _ := sonic.Marshal(validMsg)
 		_ = conn.WriteMessage(websocket.TextMessage, bytes)
 
 		// 2. Send ticker payload with zero bid (should be filtered out)
-		zeroBidMsg := []tickerPayload{{
+		zeroBidMsg := tickerPayload{
 			Symbol:  "ETHUSDT",
 			BestBid: "0",
 			BestAsk: "3500.00",
 			QVolume: "500000",
-		}}
+		}
 		bytes, _ = sonic.Marshal(zeroBidMsg)
 		_ = conn.WriteMessage(websocket.TextMessage, bytes)
 
@@ -161,10 +160,23 @@ func TestBinanceAdapter_PublicConnectMethods(t *testing.T) {
 	tickChan := make(chan domain.MarketTick, 1)
 	sink := &testFundingSink{updates: make(map[string]decimal.Decimal)}
 
-	// Pre-cancelled ctx: Connect* MUST return promptly. A cancelled-ctx dial error is expected.
-	_ = adapter.ConnectSpot(ctx, tickChan)
-	_ = adapter.ConnectFutures(ctx, tickChan)
-	_ = adapter.ConnectFunding(ctx, sink)
+	assert.NoError(t, adapter.ConnectSpot(ctx, tickChan))
+	assert.NoError(t, adapter.ConnectFutures(ctx, tickChan))
+	assert.NoError(t, adapter.ConnectFunding(ctx, sink))
+}
+
+func TestBinanceAdapter_Listen_ContextCancelled(t *testing.T) {
+	t.Parallel()
+
+	adapter := NewAdapter()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Pre-cancelled context
+
+	outChan := make(chan domain.MarketTick, 1)
+	adapter.listen(ctx, "ws://localhost:9999", domain.MarketTypeSpot, outChan)
+
+	sink := &testFundingSink{updates: make(map[string]decimal.Decimal)}
+	adapter.listenFunding(ctx, sink)
 }
 
 func TestBinanceAdapter_ConnectAndRead_DialError(t *testing.T) {
@@ -177,7 +189,19 @@ func TestBinanceAdapter_ConnectAndRead_DialError(t *testing.T) {
 	// Invalid port to trigger dial error
 	err := adapter.connectAndRead(ctx, "ws://127.0.0.1:1", domain.MarketTypeSpot, outChan)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "dial:")
+	assert.Contains(t, err.Error(), "dial error")
+}
+
+func TestBinanceAdapter_Listen_ReconnectionContextDone(t *testing.T) {
+	t.Parallel()
+
+	adapter := NewAdapter()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	outChan := make(chan domain.MarketTick, 1)
+	// Invalid URL triggers reconnect branch, which exits when ctx times out after 50ms
+	adapter.listen(ctx, "ws://127.0.0.1:1", domain.MarketTypeFutures, outChan)
 }
 
 func TestBinanceAdapter_ConnectAndRead_ChannelFullDrop(t *testing.T) {
@@ -190,12 +214,12 @@ func TestBinanceAdapter_ConnectAndRead_ChannelFullDrop(t *testing.T) {
 		}
 		defer conn.Close()
 
-		msg := []tickerPayload{{
+		msg := tickerPayload{
 			Symbol:  "BTCUSDT",
 			BestBid: "65000",
 			BestAsk: "65001",
 			QVolume: "100",
-		}}
+		}
 		bytes, _ := sonic.Marshal(msg)
 		_ = conn.WriteMessage(websocket.TextMessage, bytes)
 

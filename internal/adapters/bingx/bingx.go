@@ -5,6 +5,9 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto-screener/internal/domain"
+	"crypto-screener/internal/ingress"
+	"crypto-screener/internal/retry"
+	"crypto-screener/internal/wsutil"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +32,10 @@ const (
 	reconnectDelay   = 3 * time.Second
 )
 
-var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+var (
+	dialer     = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
+	httpClient = &http.Client{Timeout: 10 * time.Second}
+)
 
 // ✅ Pool для переиспользования gzip.Reader
 // gzip.NewReader аллоцирует буферы при каждом вызове
@@ -65,6 +71,78 @@ type Adapter struct {
 
 func NewAdapter() *Adapter { return &Adapter{} }
 
+func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
+	if sink == nil {
+		return fmt.Errorf("BingX funding sink is nil")
+	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := a.pollFunding(ctx, sink); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️ BingX funding poll: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate", nil)
+	if err != nil {
+		return fmt.Errorf("pollFunding: %w", err)
+	}
+	r, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("pollFunding: %w", err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode < 200 || r.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %s", r.Status)
+	}
+	var x struct {
+		Code int             `json:"code"`
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+		return fmt.Errorf("pollFunding: %w", err)
+	}
+	if x.Code != 0 {
+		return fmt.Errorf("API code %d", x.Code)
+	}
+	type row struct {
+		Symbol          string `json:"symbol"`
+		FundingRate     string `json:"fundingRate"`
+		NextFundingTime int64  `json:"nextFundingTime"`
+	}
+	var rows []row
+	trim := bytes.TrimSpace(x.Data)
+	if len(trim) > 0 && trim[0] == '[' {
+		if err := json.Unmarshal(trim, &rows); err != nil {
+			return fmt.Errorf("pollFunding: %w", err)
+		}
+	} else {
+		var one row
+		if err := json.Unmarshal(trim, &one); err != nil {
+			return fmt.Errorf("pollFunding: %w", err)
+		}
+		rows = []row{one}
+	}
+	now := time.Now()
+	for _, v := range rows {
+		rate, err := decimal.NewFromString(v.FundingRate)
+		if err != nil {
+			continue
+		}
+		sym := strings.ReplaceAll(v.Symbol, "-", "")
+		if err := sink.UpdateFunding("BINGX", sym, rate, time.UnixMilli(v.NextFundingTime), now); err != nil {
+			return fmt.Errorf("update BingX funding %s: %w", sym, err)
+		}
+	}
+	return nil
+}
+
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
 	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
 	return nil
@@ -81,7 +159,9 @@ func (a *Adapter) listen(
 	mType domain.MarketType,
 	out chan<- domain.MarketTick,
 ) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for {
+		startedAt := time.Now()
 		if ctx.Err() != nil {
 			return
 		}
@@ -91,10 +171,11 @@ func (a *Adapter) listen(
 			}
 			log.Printf("⚠️  BingX %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
 		}
-		select {
-		case <-ctx.Done():
+		if time.Since(startedAt) >= 30*time.Second {
+			backoff.Reset()
+		}
+		if !backoff.Wait(ctx.Done()) {
 			return
-		case <-time.After(reconnectDelay):
 		}
 	}
 }
@@ -152,7 +233,9 @@ func (a *Adapter) connectAndRead(
 		}
 
 		// Сбрасываем дедлайн при каждом сообщении
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait))
+		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+			return fmt.Errorf("refresh BingX read deadline: %w", err)
+		}
 
 		// Декомпрессия gzip
 		data, err := decompressGzip(msg)
@@ -190,12 +273,7 @@ func (a *Adapter) connectAndRead(
 			if !ok {
 				continue
 			}
-			select {
-			case out <- tick:
-			case <-connCtx.Done():
-				return nil
-			default:
-			}
+			ingress.Submit(out, tick)
 		}
 	}
 }
@@ -228,6 +306,9 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 
 	// ✅ Нормализация: "BTC-USDT" → "BTCUSDT"
 	symbol := strings.ReplaceAll(d.Symbol, "-", "")
+	if !strings.HasSuffix(strings.ToUpper(symbol), "USDT") {
+		return domain.MarketTick{}, false
+	}
 
 	return domain.MarketTick{
 		Exchange:    "BINGX",
@@ -237,7 +318,7 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 		BestAsk:     ask,
 		QuoteVolume: qVol,
 		EventTime:   ts,
-		ReceivedAt:  ts,
+		ReceivedAt:  time.Now(),
 		Timestamp:   ts,
 	}, true
 }
@@ -258,7 +339,7 @@ func decompressGzip(data []byte) ([]byte, error) {
 
 	if err := gr.Reset(bytes.NewReader(data)); err != nil {
 		gzipReaderPool.Put(gr)
-		return nil, err
+		return nil, fmt.Errorf("decompressGzip: %w", err)
 	}
 
 	result, err := io.ReadAll(io.LimitReader(gr, 4<<20))
@@ -274,13 +355,19 @@ func decompressGzip(data []byte) ([]byte, error) {
 func (a *Adapter) writeMessage(conn *websocket.Conn, messageType int, data []byte) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
-	return conn.WriteMessage(messageType, data)
+	if err := conn.WriteMessage(messageType, data); err != nil {
+		return fmt.Errorf("write websocket message: %w", err)
+	}
+	return nil
 }
 
 func (a *Adapter) writeJSON(conn *websocket.Conn, v any) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
-	return conn.WriteJSON(v)
+	if err := conn.WriteJSON(v); err != nil {
+		return fmt.Errorf("write websocket JSON: %w", err)
+	}
+	return nil
 }
 
 func closeOnCtx(ctx context.Context, conn *websocket.Conn) {
@@ -296,6 +383,8 @@ func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) er
 }
 
 type bingxCandleMessage struct {
+	Code     int    `json:"code"`
+	Msg      string `json:"msg"`
 	DataType string `json:"dataType"`
 	Data     struct {
 		EventTime int64  `json:"E"`
@@ -323,6 +412,7 @@ type bingxSwapContractsResponse struct {
 }
 
 func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, spot bool) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for ctx.Err() == nil {
 		symbols, err := bingxCandleSymbols(ctx, spot)
 		if err != nil {
@@ -330,19 +420,26 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, spo
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(reconnectDelay):
+			case <-retry.After(reconnectDelay):
 			}
 			continue
 		}
+		var wg sync.WaitGroup
 		for i := 0; i < len(symbols); i += 50 {
 			end := i + 50
 			if end > len(symbols) {
 				end = len(symbols)
 			}
 			part := append([]string(nil), symbols[i:end]...)
-			if err := a.readCandleShard(ctx, sink, part, spot); err != nil && ctx.Err() == nil {
-				log.Printf("⚠️ BingX candle WS: %v", err)
-			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.runBingXCandleShard(ctx, sink, part, spot)
+			}()
+		}
+		wg.Wait()
+		if ctx.Err() == nil && !backoff.Wait(ctx.Done()) {
+			return
 		}
 	}
 }
@@ -354,17 +451,23 @@ func bingxCandleSymbols(ctx context.Context, spot bool) ([]string, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("bingxCandleSymbols: %w", err)
 	}
-	r, err := http.DefaultClient.Do(req)
+	r, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("bingxCandleSymbols: %w", err)
 	}
 	defer r.Body.Close()
+	if r.StatusCode < 200 || r.StatusCode >= 300 {
+		return nil, fmt.Errorf("bingx candle symbols HTTP %s", r.Status)
+	}
 	if spot {
 		var x bingxSpotSymbolsResponse
 		if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("bingxCandleSymbols: %w", err)
+		}
+		if x.Code != 0 {
+			return nil, fmt.Errorf("bingx candle symbols API code %d", x.Code)
 		}
 		out := make([]string, 0, len(x.Data))
 		for _, v := range x.Data {
@@ -376,7 +479,10 @@ func bingxCandleSymbols(ctx context.Context, spot bool) ([]string, error) {
 	}
 	var x bingxSwapContractsResponse
 	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("bingxCandleSymbols: %w", err)
+	}
+	if x.Code != 0 {
+		return nil, fmt.Errorf("bingx candle symbols API code %d", x.Code)
 	}
 	out := make([]string, 0, len(x.Data))
 	for _, v := range x.Data {
@@ -387,6 +493,18 @@ func bingxCandleSymbols(ctx context.Context, spot bool) ([]string, error) {
 	return out, nil
 }
 
+func (a *Adapter) runBingXCandleShard(ctx context.Context, sink domain.CandleSink, symbols []string, spot bool) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
+	for ctx.Err() == nil {
+		if err := a.readCandleShard(ctx, sink, symbols, spot); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️ BingX candle WS: %v", err)
+		}
+		if ctx.Err() == nil && !backoff.Wait(ctx.Done()) {
+			return
+		}
+	}
+}
+
 func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, symbols []string, spot bool) error {
 	url := spotWS
 	if !spot {
@@ -394,18 +512,23 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, s
 	}
 	conn, _, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("readCandleShard: %w", err)
 	}
 	defer conn.Close()
 	conn.SetReadLimit(1 << 20)
-	go closeOnCtx(ctx, conn)
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if err := wsutil.StartHeartbeat(connCtx, conn, 20*time.Second, 60*time.Second); err != nil {
+		return fmt.Errorf("start websocket heartbeat: %w", err)
+	}
+	go closeOnCtx(connCtx, conn)
 	for _, sym := range symbols {
 		interval := "1min"
 		if !spot {
 			interval = "1m"
 		}
 		if err := a.writeJSON(conn, subscribeMsg{ID: fmt.Sprintf("candle-%d", time.Now().UnixNano()), ReqType: "sub", DataType: sym + "@kline_" + interval}); err != nil {
-			return err
+			return fmt.Errorf("readCandleShard: %w", err)
 		}
 	}
 	for {
@@ -414,26 +537,34 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, s
 			if ctx.Err() != nil {
 				return nil
 			}
-			return err
+			return fmt.Errorf("readCandleShard: %w", err)
 		}
 		raw, err := decompressGzip(msg)
 		if err != nil {
 			raw = msg
 		}
 		var r bingxCandleMessage
-		if sonic.Unmarshal(raw, &r) != nil || r.Data.Symbol == "" {
+		if err := sonic.Unmarshal(raw, &r); err != nil {
+			continue
+		}
+		if r.Code != 0 {
+			return fmt.Errorf("BingX candle subscription rejected: code=%d msg=%q", r.Code, r.Msg)
+		}
+		if r.Data.Symbol == "" {
 			continue
 		}
 		q, err := decimal.NewFromString(r.Data.K.Quote)
-		if err != nil || !q.IsPositive() {
+		if err != nil || q.IsNegative() {
 			continue
 		}
 		et := time.UnixMilli(r.Data.EventTime)
-		sink.UpdateCandle(domain.MarketCandle{Exchange: "BINGX", Symbol: strings.ReplaceAll(r.Data.Symbol, "-", ""), MarketType: func() domain.MarketType {
+		if err := sink.UpdateCandle(domain.MarketCandle{Exchange: "BINGX", Symbol: strings.ReplaceAll(r.Data.Symbol, "-", ""), MarketType: func() domain.MarketType {
 			if spot {
 				return domain.MarketTypeSpot
 			}
 			return domain.MarketTypeFutures
-		}(), OpenTime: time.UnixMilli(r.Data.K.Start), CloseTime: time.UnixMilli(r.Data.K.End), QuoteVolume: q, EventTime: et})
+		}(), OpenTime: time.UnixMilli(r.Data.K.Start), CloseTime: time.UnixMilli(r.Data.K.End), QuoteVolume: q, EventTime: et}); err != nil {
+			return fmt.Errorf("readCandleShard: %w", err)
+		}
 	}
 }
