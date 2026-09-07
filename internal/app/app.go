@@ -50,6 +50,7 @@ type Application struct {
 	// при отсутствии приложение корректно деградирует.
 	settingsRepo     domain.SettingsRepository
 	statsRepo        domain.StatsRepository
+	signalsRepo      domain.SignalReader
 	router           *NotificationRouter
 	tickChan         chan domain.MarketTick
 	trackerChan      chan domain.SpreadEvent
@@ -57,6 +58,7 @@ type Application struct {
 	ctx              atomic.Pointer[context.Context]
 	started          atomic.Bool
 	accepting        atomic.Bool
+	telegram         atomic.Value // domain.TelegramSender (для алертов мониторинга)
 	commandMu        sync.Mutex
 	ingestionWg      sync.WaitGroup
 	trackerWg        sync.WaitGroup
@@ -96,9 +98,60 @@ func NewApplication(cfg *domain.ScreenerConfig, repo domain.SignalRepository, us
 	if statsRepo, ok := repo.(domain.StatsRepository); ok {
 		a.statsRepo = statsRepo
 	}
+	if signalsRepo, ok := repo.(domain.SignalReader); ok {
+		a.signalsRepo = signalsRepo
+	}
 	return a, nil
 }
-func (a *Application) SetTelegramSender(tg domain.TelegramSender) { a.router.SetTelegramSender(tg) }
+func (a *Application) SetTelegramSender(tg domain.TelegramSender) {
+	a.telegram.Store(tg)
+	a.router.SetTelegramSender(tg)
+}
+
+// HandleAlerts пересылает уведомления Alertmanager ( observability /alerts,
+// вебхук из docker-compose) администраторам в Telegram. Вызывается HTTP-
+// обработчиком сервера метрик.
+func (a *Application) HandleAlerts(alert observability.Alert) {
+	admins := a.AdminChatIDs()
+	if len(admins) == 0 {
+		return
+	}
+	tg, _ := a.telegram.Load().(domain.TelegramSender)
+	if tg == nil {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("🚨 Мониторинг:\n")
+	for _, m := range alert.Alerts {
+		name := m.Labels["alertname"]
+		if name == "" {
+			name = "ALERT"
+		}
+		emoji := "🔴"
+		if m.Status == "resolved" {
+			emoji = "🟢"
+		}
+		summary := m.Annotations["summary"]
+		descr := m.Annotations["description"]
+		fmt.Fprintf(&b, "%s %s (%s)", emoji, name, m.Status)
+		if summary != "" {
+			fmt.Fprintf(&b, "\n%s", summary)
+		}
+		if descr != "" {
+			fmt.Fprintf(&b, "\n%s", descr)
+		}
+		b.WriteString("\n\n")
+	}
+	tg.Broadcast(strings.TrimRight(b.String(), "\n"), admins)
+}
+
+// AdminChatIDs возвращает копию ID администраторов (для алертов мониторинга).
+func (a *Application) AdminChatIDs() []int64 {
+	a.adminMu.RLock()
+	defer a.adminMu.RUnlock()
+	return append([]int64(nil), a.adminIDs...)
+}
+
 func (a *Application) SetAdminIDs(ids []int64) {
 	copied := append([]int64(nil), ids...)
 	a.adminMu.Lock()
@@ -664,8 +717,33 @@ func (a *Application) HandleCommand(botID, chatID int64, username, cmd string, a
 			avgDur = st.AvgDuration.Round(time.Second).String()
 		}
 		return fmt.Sprintf("📊 Статистика за 24 часа:\nОткрыто сигналов: %d\nЗакрыто: %d\nСредний пик спреда (net): %s\nСредняя длительность: %s\nАктивно сейчас: %d", st.Opened24h, st.Closed24h, avgPeak, avgDur, a.tracker.ActiveCount())
+	case "signals":
+		if a.signalsRepo == nil {
+			return "❌ История сигналов недоступна: репозиторий не поддерживает чтение."
+		}
+		sigCtx, cancel := context.WithTimeout(context.WithoutCancel(a.getContext()), 5*time.Second)
+		defer cancel()
+		recent, err := a.signalsRepo.RecentClosedSignals(sigCtx, 10)
+		if err != nil {
+			return fmt.Sprintf("❌ Ошибка истории сигналов: %v", err)
+		}
+		active := a.tracker.ActiveSnapshot()
+		var b strings.Builder
+		fmt.Fprintf(&b, "📊 Сигналы\nАктивных сейчас: %d\n", len(active))
+		for i := len(active) - 1; i >= 0 && i >= len(active)-5; i-- {
+			sg := active[i]
+			fmt.Fprintf(&b, "🟢 %s %s %s[%s]→%s[%s] тек. %s%%\n", sg.Symbol, sg.SpreadType, sg.BuyExchange, sg.BuyMarket, sg.SellExchange, sg.SellMarket, sg.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(2))
+		}
+		b.WriteString("Последние закрытые (пик, net %):\n")
+		if len(recent) == 0 {
+			b.WriteString("— пока пусто\n")
+		}
+		for i, sg := range recent {
+			fmt.Fprintf(&b, "%d) %s %s %s→%s пик %s%% · %s\n", i+1, sg.Symbol, sg.SpreadType, sg.BuyExchange, sg.SellExchange, sg.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(2), sg.Duration.Round(time.Second))
+		}
+		return b.String()
 	case "help":
-		return "📋 *Доступные команды:*\n/start — Подписаться на сигналы\n/stop — Отписаться\n/setcross <%> — Мин. спред\n/setvol <USDT> — Мин. объём\n/settimeframe <tf> — Таймфрейм\n/setfundingtime <minutes> — Не присылать сигнал ближе к funding\n\n*Администраторам:*\n/sethardspread <%> — Глобальный минимум спреда\n/setfees — Комиссии бирж (учитываются в спреде)\n/addex /rmex — Подключение бирж на лету\n/stats — Статистика сигналов за 24 часа"
+		return "📋 *Доступные команды:*\n/start — Подписаться на сигналы\n/stop — Отписаться\n/setcross <%> — Мин. спред\n/setvol <USDT> — Мин. объём\n/settimeframe <tf> — Таймфрейм\n/setfundingtime <minutes> — Не присылать сигнал ближе к funding\n/signals — Активные и последние сигналы\n\n*Администраторам:*\n/sethardspread <%> — Глобальный минимум спреда\n/setfees — Комиссии бирж (учитываются в спреде)\n/addex /rmex — Подключение бирж на лету\n/stats — Статистика сигналов за 24 часа"
 	case "addex":
 		if len(args) < 1 {
 			return "Usage: /addex <exchange>"

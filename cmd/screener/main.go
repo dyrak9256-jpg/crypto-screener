@@ -141,12 +141,14 @@ func main() {
 		return snapshot
 	}
 	metricsServer := observability.NewServer(metricsAddr, statusSnapshot)
+	// Вебхук Alertmanager (docker-compose сервис alertmanager) → Telegram админам.
+	metricsServer.SetAlertsHandler(application.HandleAlerts)
 	go func() {
 		if err := metricsServer.Run(ctx); err != nil {
 			slog.Error("metrics server stopped", "addr", metricsAddr, "error", err)
 		}
 	}()
-	slog.Info("metrics/status server listening", "addr", metricsAddr, "endpoints", "/metrics /healthz /api/status /debug/pprof/")
+	slog.Info("metrics/status server listening", "addr", metricsAddr, "endpoints", "/metrics /healthz /api/status /alerts /debug/pprof/")
 
 	appErr := make(chan error, 1)
 	tgDone := make(chan struct{})

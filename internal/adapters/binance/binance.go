@@ -5,11 +5,13 @@ import (
 	"crypto-screener/internal/domain"
 	"crypto-screener/internal/ingress"
 	"crypto-screener/internal/retry"
+	"crypto-screener/internal/symbolscache"
 	"crypto-screener/internal/wsutil"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -20,31 +22,65 @@ import (
 )
 
 const (
-	spotWS    = "wss://stream.binance.com:9443/ws/!ticker@arr"
-	futuresWS = "wss://fstream.binance.com/ws/!ticker@arr"
-	fundingWS = "wss://fstream.binance.com/ws/!markPrice@arr"
-
 	handshakeTimeout = 10 * time.Second
 	pingInterval     = 3 * time.Minute
 	pongWait         = 10 * time.Second
 	reconnectDelay   = 3 * time.Second
+
+	// binanceSpotShard — символов на одно спот-WS-соединение (комбинированный
+	// поток ?streams=… ограничен длиной URL ~8КБ; 150 симв. ≈ 2.7КБ).
+	binanceSpotShard = 150
 )
+
+// По умолчанию спот-данные идут через официальные гео-независимые зеркала
+// Binance (data-api / data-stream.binance.vision): api.binance.com и
+// stream/fstream.binance.com отдают 451 из ряда юрисдикций, зеркала — нет.
+// Фьючерсы зеркал не имеют: если fstream гео-блокирован, задайте
+// BINANCE_SPOT_ONLY=1 (фьючерсы/funding/фьючерсные свечи отключаются),
+// либо прокси-хосты через переменные ниже.
+var (
+	spotStreamWS  = envStr("BINANCE_SPOT_WS", "wss://data-stream.binance.vision/stream")
+	spotRestBase  = envStr("BINANCE_SPOT_REST", "https://data-api.binance.vision")
+	futuresWS     = envStr("BINANCE_FUTURES_WS", "wss://fstream.binance.com/ws/!ticker@arr")
+	futuresStream = envStr("BINANCE_FUTURES_STREAM_WS", "wss://fstream.binance.com/stream")
+	futuresRest   = envStr("BINANCE_FUTURES_REST", "https://fapi.binance.com")
+	fundingWS     = envStr("BINANCE_FUNDING_WS", "wss://fstream.binance.com/ws/!markPrice@arr")
+	spotOnly      = os.Getenv("BINANCE_SPOT_ONLY") != ""
+)
+
+func envStr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return def
+}
 
 var (
 	dialer     = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
 	httpClient = &http.Client{Timeout: 10 * time.Second}
 )
 
+// Тикер 24h (spot @ticker и futures !ticker@arr): содержит и BBO (b/a),
+// и quote-объём (q). Поля e/B/A объявлены явно: без них sonic
+// кейс-инсенситивно матчит "e" (строка "24hrTicker") в E (int64) —
+// весь Unmarshal падает, а "B"/"A" (размеры заявок) затирают цены b/a.
 type tickerPayload struct {
 	Symbol    string `json:"s"`
+	Event     string `json:"e"`
 	EventTime int64  `json:"E"`
 	BestBid   string `json:"b"`
 	BestAsk   string `json:"a"`
 	QVolume   string `json:"q"`
+	BidQty    string `json:"B"`
+	AskQty    string `json:"A"`
 }
 
+// markPrice-поток (funding): {"e":"markPriceUpdate", …} — поле e обязательно
+// по той же причине (кейс-инсенситивный матч в E ломал всю раскодировку,
+// из-за чего funding Binance молчал даже на доступных хостах).
 type fundingPayload struct {
 	Symbol          string `json:"s"`
+	Event           string `json:"e"`
 	EventTime       int64  `json:"E"`
 	FundingRate     string `json:"r"`
 	NextFundingTime int64  `json:"T"`
@@ -55,29 +91,34 @@ type Adapter struct{}
 func NewAdapter() *Adapter { return &Adapter{} }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
+	a.runSpotFeed(ctx, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
+	if spotOnly {
+		log.Printf("⏭️  Binance FUTURES отключён (BINANCE_SPOT_ONLY=1): fstream гео-блокирован в этом регионе")
+		<-ctx.Done()
+		return nil
+	}
 	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
 	return nil
 }
 
 func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) error {
+	if spotOnly {
+		log.Printf("⏭️  Binance funding отключён (BINANCE_SPOT_ONLY=1): fstream гео-блокирован в этом регионе")
+		<-ctx.Done()
+		return nil
+	}
 	a.listenFunding(ctx, sink)
 	return nil
 }
 
 func (a *Adapter) ConnectCandles(ctx context.Context, sink domain.CandleSink) error {
-	for _, spec := range []struct {
-		url, rest string
-		market    domain.MarketType
-	}{
-		{"wss://stream.binance.com:9443/stream", "https://api.binance.com/api/v3/exchangeInfo", domain.MarketTypeSpot},
-		{"wss://fstream.binance.com/stream", "https://fapi.binance.com/fapi/v1/exchangeInfo", domain.MarketTypeFutures},
-	} {
-		go a.runCandleFeed(ctx, sink, spec.url, spec.rest, spec.market)
+	go a.runCandleFeed(ctx, sink, spotStreamWS, spotRestBase+"/api/v3/exchangeInfo", domain.MarketTypeSpot)
+	if !spotOnly {
+		go a.runCandleFeed(ctx, sink, futuresStream, futuresRest+"/fapi/v1/exchangeInfo", domain.MarketTypeFutures)
 	}
 	<-ctx.Done()
 	return nil
@@ -220,6 +261,131 @@ func (a *Adapter) readBinanceCandleShard(ctx context.Context, sink domain.Candle
 			return fmt.Errorf("readBinanceCandleShard: %w", err)
 		}
 	}
+}
+
+// --- Спот-тикеры (зеркало data-stream.binance.vision) ---
+
+// runSpotFeed: список USDT-пар из зеркального exchangeInfo, шардированные
+// соединения с подписками SYM@ticker (24h-тикер содержит и BBO (b/a),
+// и quote-объём (q) — один поток даёт всё).
+func (a *Adapter) runSpotFeed(ctx context.Context, out chan<- domain.MarketTick) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
+	for ctx.Err() == nil {
+		symbols, err := binanceSpotSymbolsCached(ctx)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("⚠️  Binance SPOT symbols: %v", err)
+			}
+			if !backoff.Wait(ctx.Done()) {
+				return
+			}
+			continue
+		}
+		shards := (len(symbols) + binanceSpotShard - 1) / binanceSpotShard
+		log.Printf("✅ Binance SPOT: %d symbols → %d WS shards", len(symbols), shards)
+		var wg sync.WaitGroup
+		for i := 0; i < len(symbols); i += binanceSpotShard {
+			end := min(i+binanceSpotShard, len(symbols))
+			part := append([]string(nil), symbols[i:end]...)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.runSpotShard(ctx, out, part)
+			}()
+		}
+		wg.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		if !backoff.Wait(ctx.Done()) {
+			return
+		}
+	}
+}
+
+func (a *Adapter) runSpotShard(ctx context.Context, out chan<- domain.MarketTick, symbols []string) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
+	for ctx.Err() == nil {
+		startedAt := time.Now()
+		if err := a.readSpotShard(ctx, out, symbols); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️  Binance SPOT WS: %v — reconnecting in %s", err, reconnectDelay)
+		}
+		if time.Since(startedAt) >= 30*time.Second {
+			backoff.Reset()
+		}
+		if !backoff.Wait(ctx.Done()) {
+			return
+		}
+	}
+}
+
+func (a *Adapter) readSpotShard(ctx context.Context, out chan<- domain.MarketTick, symbols []string) error {
+	streams := make([]string, 0, len(symbols))
+	for _, sym := range symbols {
+		streams = append(streams, strings.ToLower(sym)+"@ticker")
+	}
+	u := spotStreamWS + "?streams=" + strings.Join(streams, "/")
+	conn, _, err := dialer.DialContext(ctx, u, nil)
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	conn.SetReadLimit(1 << 20)
+	defer conn.Close()
+
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go closeOnCtx(connCtx, conn)
+
+	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	go keepAlive(connCtx, conn, "SPOT")
+	log.Printf("✅ Binance SPOT shard: %d symbols", len(symbols))
+
+	for {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("read: %w", err)
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
+			return fmt.Errorf("refresh Binance SPOT deadline: %w", err)
+		}
+		// Комбинированный поток: {"stream":"btcusdt@ticker","data":{…}}.
+		var env struct {
+			Stream string        `json:"stream"`
+			Data   tickerPayload `json:"data"`
+		}
+		if err := sonic.Unmarshal(msg, &env); err != nil || env.Data.Symbol == "" {
+			continue
+		}
+		eventTime := time.Now()
+		if env.Data.EventTime > 0 {
+			eventTime = time.UnixMilli(env.Data.EventTime)
+		}
+		if tick, ok := toMarketTick(&env.Data, domain.MarketTypeSpot, eventTime); ok {
+			ingress.Submit(out, tick)
+		}
+	}
+}
+
+// binanceSpotSymbolsCached: exchangeInfo зеркала + дисковый кэш на случай
+// недоступности зеркала (перезапуск без сети/блокировка — тикеры живут).
+func binanceSpotSymbolsCached(ctx context.Context) ([]string, error) {
+	symbols, err := binanceSymbols(ctx, spotRestBase+"/api/v3/exchangeInfo")
+	if err != nil {
+		if cached, cErr := symbolscache.Load("binance-spot"); cErr == nil {
+			log.Printf("📋 Binance SPOT: REST недоступен (%v) — %d символов из дискового кэша", err, len(cached))
+			return cached, nil
+		}
+		return nil, err
+	}
+	if serr := symbolscache.Save("binance-spot", symbols); serr != nil {
+		log.Printf("⚠️  Binance SPOT: кэш символов не записан: %v", serr)
+	}
+	return symbols, nil
 }
 
 // --- Ticker ---

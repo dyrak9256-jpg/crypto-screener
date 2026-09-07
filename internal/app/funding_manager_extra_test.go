@@ -125,3 +125,27 @@ func TestFundingConfig_Validate(t *testing.T) {
 	require.Error(t, FundingConfig{MinSpread: decimal.Zero}.Validate()) // 0 staleness → normalize не спасает при Validate напрямую
 	require.NoError(t, FundingConfig{MinSpread: decimal.Zero, MaxDataStaleness: time.Minute}.Validate())
 }
+
+// Per-exchange бюджет свежести: OKX 90с (дефолт) прощает 70-секундный лаг,
+// глобальные 60с для остальных бирж — нет.
+func TestFundingManager_PerExchangeStaleness(t *testing.T) {
+	now := time.Now()
+	clock := &mutableClock{now: now}
+	fm, err := NewFundingManager(DefaultFundingConfig(), clock)
+	require.NoError(t, err)
+	require.NoError(t, fm.UpdateFunding("OKX", "BTCUSDT", mustDec("0.001"), now.Add(time.Hour), now))
+	require.NoError(t, fm.UpdateFunding("BITGET", "BTCUSDT", mustDec("0.001"), now.Add(time.Hour), now))
+	clock.now = now.Add(70 * time.Second)
+
+	okx := fm.EvaluateSpotFutures("OKX", "BTCUSDT", mustDec("0.02"), clock.now)
+	require.True(t, okx.Profitable, "OKX-бюджет 90с: 70с — ещё свежо")
+
+	bitget := fm.EvaluateSpotFutures("BITGET", "BTCUSDT", mustDec("0.02"), clock.now)
+	require.False(t, bitget.Profitable)
+	require.Equal(t, ReasonDataStale, bitget.Reason, "глобальный бюджет 60с: 70с — устарело")
+
+	// Конфигурация с невалидным per-exchange значением отклоняется.
+	cfg := DefaultFundingConfig()
+	cfg.MaxDataStalenessByExchange = map[string]time.Duration{"OKX": -1}
+	require.Error(t, fm.UpdateConfig(cfg))
+}

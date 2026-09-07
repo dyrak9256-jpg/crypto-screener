@@ -87,7 +87,11 @@ func (nr *NotificationRouter) worker() {
 			// Shutdown must be bounded. Jobs already accepted into the queue are
 			// transient notifications; persistence/lifecycle state is handled by
 			// the tracker separately. Do not spend an unbounded amount of time
-			// draining Telegram work during process termination.
+			// draining Telegram work during process termination. NOTE: when both
+			// a queued job and the closed stop-channel are ready, select picks
+			// randomly — a pending notification MAY be dropped at shutdown. This
+			// is an accepted trade-off; callers that must guarantee delivery wait
+			// for Broadcast completion before Close (see tests).
 			return
 		}
 	}

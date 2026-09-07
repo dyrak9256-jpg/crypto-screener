@@ -30,12 +30,30 @@ const (
 )
 
 type FundingConfig struct {
-	MinSpread        decimal.Decimal
+	MinSpread decimal.Decimal
+	// MaxDataStaleness — глобальный бюджет свежести funding-данных.
 	MaxDataStaleness time.Duration
+	// MaxDataStalenessByExchange — индивидуальные бюджеты по биржам
+	// (приоритетнее глобального). Пример: OKX поллит funding каждые ~30с,
+	// глобальные 60с слишком впритык при лаге — для неё задан 90с.
+	MaxDataStalenessByExchange map[string]time.Duration
 }
 
 func DefaultFundingConfig() FundingConfig {
-	return FundingConfig{MaxDataStaleness: 60 * time.Second}
+	return FundingConfig{
+		MaxDataStaleness: 60 * time.Second,
+		MaxDataStalenessByExchange: map[string]time.Duration{
+			"OKX": 90 * time.Second,
+		},
+	}
+}
+
+// stalenessFor возвращает бюджет свежести конкретной биржи.
+func (c FundingConfig) stalenessFor(exchange string) time.Duration {
+	if d, ok := c.MaxDataStalenessByExchange[strings.ToUpper(strings.TrimSpace(exchange))]; ok && d > 0 {
+		return d
+	}
+	return c.MaxDataStaleness
 }
 
 func (c FundingConfig) normalize() FundingConfig {
@@ -52,6 +70,11 @@ func (c FundingConfig) Validate() error {
 	}
 	if c.MaxDataStaleness <= 0 {
 		return errors.New("max data staleness must be positive")
+	}
+	for ex, d := range c.MaxDataStalenessByExchange {
+		if d <= 0 {
+			return fmt.Errorf("max data staleness for %s must be positive", ex)
+		}
 	}
 	return nil
 }
@@ -220,7 +243,7 @@ func (fm *FundingManager) EvictStale() {
 	now := fm.clock.Now()
 	fm.mu.Lock()
 	for k, r := range fm.rates {
-		if r.IsStale(now, p.MaxDataStaleness) {
+		if r.IsStale(now, p.stalenessFor(k.Exchange)) {
 			delete(fm.rates, k)
 		}
 	}
@@ -314,7 +337,7 @@ func (fm *FundingManager) validRecord(exchange, symbol string, now time.Time, cf
 	if r.NextFundingTime.IsZero() {
 		return ArbResult{Reason: ReasonNoData}, false
 	}
-	if r.IsStale(now, cfg.MaxDataStaleness) {
+	if r.IsStale(now, cfg.stalenessFor(exchange)) {
 		return ArbResult{Reason: ReasonDataStale, BuyFundingRate: r.Rate, SellFundingRate: r.Rate, BuyNextFundingTime: r.NextFundingTime, SellNextFundingTime: r.NextFundingTime}, false
 	}
 	return ArbResult{Profitable: true, Reason: ReasonProfitable, FundingRate: r.Rate, NextFundingTime: r.NextFundingTime}, true

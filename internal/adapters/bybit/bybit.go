@@ -5,6 +5,7 @@ import (
 	"crypto-screener/internal/domain"
 	"crypto-screener/internal/ingress"
 	"crypto-screener/internal/retry"
+	"crypto-screener/internal/symbolscache"
 	"crypto-screener/internal/wsutil"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,8 +37,56 @@ const (
 	pongWait            = 10 * time.Second
 	reconnectDelay      = 3 * time.Second
 	spotSubBatchSize    = 10
-	futuresSubBatchSize = 50
+	futuresSubBatchSize = 10
+
+	// Bybit допускает не более 10 подписочных запросов/сек на соединение
+	// (v5 public WS): батчи отправляются с паузой, иначе биржа молча
+	// отклоняет всё после первой десятки (зонд 08.09.2026).
+	bybitSubInterval = 110 * time.Millisecond
+
+	// Эмпирические лимиты Bybit WS из дата-центровых сетей (зонды 08.09.2026):
+	// 1) не более 10 аргументов на подписочный запрос (батч 20 отклоняется
+	//    целиком — это документированный лимит спота);
+	// 2) соединение принимает суммарно лишь ~10-15 подписок, остальные
+	//    молча отклоняются (анти-абьюз CloudFront).
+	// Поэтому: шард по 10 аргументам на соединение + лимит числа символов
+	// (BYBIT_SYMBOL_LIMIT, по умолчанию 100 на рынок) — соединения остаются
+	// в разумном числе, а обрезка идёт по ликвидности (seed упорядочен).
+	bybitMaxArgsPerConn = 10
+	bybitDefaultSymCap  = 100
 )
+
+// bybitSymbolLimit возвращает лимит числа символов Bybit на рынок.
+func bybitSymbolLimit() int {
+	if v := strings.TrimSpace(os.Getenv("BYBIT_SYMBOL_LIMIT")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return bybitDefaultSymCap
+}
+
+// writeSubscribeBatches отправляет батчи подписок с троттлингом
+// bybitSubInterval (≤9 запросов/сек). Прерывается по ctx.
+func writeSubscribeBatches(ctx context.Context, conn *websocket.Conn, args []string, batch int, opLabel string) error {
+	for i := 0; i < len(args); i += batch {
+		end := i + batch
+		if end > len(args) {
+			end = len(args)
+		}
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("%s: подписки прерваны (%d из %d)", opLabel, i, len(args))
+			case <-time.After(bybitSubInterval):
+			}
+		}
+		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
+			return fmt.Errorf("%s batch [%d:%d]: %w", opLabel, i, end, err)
+		}
+	}
+	return nil
+}
 
 var dialer = websocket.Dialer{HandshakeTimeout: handshakeTimeout}
 
@@ -143,15 +193,12 @@ func (a *Adapter) connectAndRead(
 	if mType == domain.MarketTypeSpot {
 		restURL = spotSymbolsURL
 	}
-	symbols, err := a.fetchSymbols(ctx, restURL)
-	if err != nil {
-		return fmt.Errorf("fetch symbols for %s: %w", mType, err)
-	}
+	symbols := a.symbolsWithFallback(ctx, restURL, mType)
 	args := make([]string, 0, len(symbols))
 	for _, symbol := range symbols {
 		args = append(args, "tickers."+symbol)
 	}
-	shards := shardArgs(args, 16000)
+	shards := shardArgsMax(args, 16000, bybitMaxArgsPerConn)
 	if len(shards) == 0 {
 		return fmt.Errorf("no %s ticker subscriptions", mType)
 	}
@@ -186,6 +233,13 @@ func (a *Adapter) connectAndRead(
 }
 
 func shardArgs(args []string, maxChars int) [][]string {
+	return shardArgsMax(args, maxChars, 0)
+}
+
+// shardArgsMax режет аргументы на группы не только по объёму JSON, но и по
+// числу: Bybit-соединение принимает ~100 аргументов подписки суммарно
+// (эмпирика 08.09.2026: всё после первой сотни молча отклоняется).
+func shardArgsMax(args []string, maxChars, maxArgs int) [][]string {
 	if maxChars <= 0 {
 		maxChars = 16000
 	}
@@ -194,7 +248,7 @@ func shardArgs(args []string, maxChars int) [][]string {
 	currentSize := 0
 	for _, arg := range args {
 		extra := len(arg) + 3 // quotes, comma and JSON framing overhead
-		if len(current) > 0 && currentSize+extra > maxChars {
+		if len(current) > 0 && (currentSize+extra > maxChars || (maxArgs > 0 && len(current) >= maxArgs)) {
 			shards = append(shards, current)
 			current = make([]string, 0, 64)
 			currentSize = 0
@@ -220,14 +274,8 @@ func (a *Adapter) readTickerShard(ctx context.Context, wsURL string, mType domai
 	if mType == domain.MarketTypeSpot {
 		batchSize = spotSubBatchSize
 	}
-	for i := 0; i < len(args); i += batchSize {
-		end := i + batchSize
-		if end > len(args) {
-			end = len(args)
-		}
-		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
-			return fmt.Errorf("subscribe ticker batch [%d:%d]: %w", i, end, err)
-		}
+	if err := writeSubscribeBatches(ctx, conn, args, batchSize, "subscribe ticker"); err != nil {
+		return err
 	}
 
 	connCtx, cancel := context.WithCancel(ctx)
@@ -369,6 +417,50 @@ func (a *Adapter) fetchSymbols(ctx context.Context, endpoint string) ([]string, 
 	return symbols, nil
 }
 
+// symbolsWithFallback: REST (api.bybit.com → резервный api.bytick.com) →
+// дисковый кэш → встроенный seed. Bybit гео-блокирует REST (CloudFront 403)
+// в ряде регионов, при этом публичные WS-потоки доступны: список символов —
+// единственное, что требует REST, поэтому фолбэк полностью оживляет биржу.
+// Успешный REST-запрос обновляет кэш на диске (SYMBOLS_CACHE_DIR).
+func (a *Adapter) symbolsWithFallback(ctx context.Context, restURL string, mType domain.MarketType) []string {
+	cacheName, seed := "bybit-linear", seedLinearSymbols
+	if mType == domain.MarketTypeSpot {
+		cacheName, seed = "bybit-spot", seedSpotSymbols
+	}
+	symbols, restErr := a.fetchSymbols(ctx, restURL)
+	if restErr != nil {
+		// Резервный хост API (тот же CloudFront-контур, иная гео-политика).
+		if alt := strings.Replace(restURL, "https://api.bybit.com", "https://api.bytick.com", 1); alt != restURL {
+			symbols, restErr = a.fetchSymbols(ctx, alt)
+		}
+	}
+	if restErr == nil {
+		if err := symbolscache.Save(cacheName, symbols); err != nil {
+			log.Printf("⚠️  Bybit %s: кэш символов не записан: %v", mType, err)
+		}
+		return capBybitSymbols(symbols, mType, "REST")
+	}
+	if cached, err := symbolscache.Load(cacheName); err == nil {
+		log.Printf("📋 Bybit %s: REST недоступен (%v) — %d символов из дискового кэша", mType, restErr, len(cached))
+		return capBybitSymbols(cached, mType, "кэш")
+	}
+	log.Printf("📋 Bybit %s: REST недоступен (%v), кэша нет — %d символов из встроенного seed", mType, restErr, len(seed))
+	return capBybitSymbols(seed, mType, "seed")
+}
+
+// capBybitSymbols обрезает список до BYBIT_SYMBOL_LIMIT: в дата-центровых
+// сетях Bybit принимает лишь ~10-15 подписок на соединение, поэтому сотни
+// символов всё равно не подписались бы. Порядок списка — по ликвидности.
+func capBybitSymbols(symbols []string, mType domain.MarketType, source string) []string {
+	limit := bybitSymbolLimit()
+	if len(symbols) <= limit {
+		return symbols
+	}
+	capped := append([]string(nil), symbols[:limit]...)
+	log.Printf("📋 Bybit %s: %d → %d символов (лимит BYBIT_SYMBOL_LIMIT, источник %s; порядок — по ликвидности)", mType, len(symbols), limit, source)
+	return capped
+}
+
 // ConnectCandles subscribes only to 1-minute klines. Higher timeframes are
 // calculated locally from these minute buckets, so the exchange sends no
 // duplicate 5m/15m/30m streams.
@@ -423,16 +515,9 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, mar
 	}
 	backoff := retry.New(reconnectDelay, 30*time.Second)
 	for ctx.Err() == nil {
-		symbols, err := a.fetchSymbols(ctx, rest)
-		if err != nil {
-			log.Printf("⚠️ Bybit %s candle symbols: %v", market, err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-retry.After(reconnectDelay):
-			}
-			continue
-		}
+		// Фолбэк REST → кэш → seed (см. symbolsWithFallback): гео-блок REST
+		// не должен останавливать и свечной фид.
+		symbols := a.symbolsWithFallback(ctx, rest, market)
 		if err := a.readCandleShard(ctx, sink, url, symbols, market, batch); err != nil && ctx.Err() == nil {
 			log.Printf("⚠️ Bybit %s candle WS: %v", market, err)
 		}
@@ -447,7 +532,7 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, u
 	for _, s := range symbols {
 		args = append(args, "kline.1."+s)
 	}
-	shards := shardArgs(args, 16000)
+	shards := shardArgsMax(args, 16000, bybitMaxArgsPerConn)
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errCh := make(chan error, len(shards))
@@ -484,14 +569,8 @@ func (a *Adapter) readCandleConnection(ctx context.Context, sink domain.CandleSi
 		return fmt.Errorf("start websocket heartbeat: %w", err)
 	}
 	go closeOnCtx(connCtx, conn)
-	for i := 0; i < len(args); i += batch {
-		end := i + batch
-		if end > len(args) {
-			end = len(args)
-		}
-		if err := conn.WriteJSON(subscribeMsg{Op: "subscribe", Args: args[i:end]}); err != nil {
-			return fmt.Errorf("subscribe candle batch [%d:%d]: %w", i, end, err)
-		}
+	if err := writeSubscribeBatches(connCtx, conn, args, batch, "subscribe candle"); err != nil {
+		return err
 	}
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -510,7 +589,11 @@ func (a *Adapter) readCandleConnection(ctx context.Context, sink domain.CandleSi
 		}
 		if r.Op == "subscribe" {
 			if r.RetCode != 0 || !r.Success {
-				return fmt.Errorf("Bybit candle subscription rejected: code=%d msg=%q", r.RetCode, r.RetMsg)
+				// Точечный отказ (например, kline-топик по символу, которого нет
+				// на площадке: seed-список/кэш шире реального листинга). Валидные
+				// подписки батча продолжают стримить — соединение не рвём,
+				// иначе одна невалидная пара убивала бы весь свечной фид.
+				log.Printf("⚠️ Bybit %s candle: часть подписок отклонена (code=%d msg=%q)", market, r.RetCode, r.RetMsg)
 			}
 			continue
 		}

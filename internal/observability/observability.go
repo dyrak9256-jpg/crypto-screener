@@ -154,8 +154,10 @@ func DBError() { dbErrorsTotal.Inc() }
 
 // Server — HTTP-сервер метрик и статуса.
 type Server struct {
-	srv      *http.Server
-	snapshot func() any
+	srv           *http.Server
+	snapshot      func() any
+	alertsMu      sync.RWMutex
+	alertsHandler func(Alert)
 }
 
 // NewServer создаёт сервер; snapshot (может быть nil) возвращает map с
@@ -166,9 +168,51 @@ func NewServer(addr string, snapshot func() any) *Server {
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/alerts", s.handleAlerts)
 	mux.Handle("/debug/pprof/", http.DefaultServeMux)
 	s.srv = &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	return s
+}
+
+// Alert — одно уведомление из Alertmanager webhook.
+type Alert struct {
+	Status string            `json:"status"`
+	Alerts []AlertmanagerMsg `json:"alerts"`
+}
+
+type AlertmanagerMsg struct {
+	Status      string            `json:"status"`
+	Labels      map[string]string `json:"labels"`
+	Annotations map[string]string `json:"annotations"`
+	StartsAt    string            `json:"startsAt"`
+}
+
+// SetAlertsHandler подключает обработчик уведомлений Alertmanager
+// (например, пересылку в Telegram администраторам). Обработчик обязан
+// возвращаться быстро — доставка идёт в фоне на стороне приложения.
+func (s *Server) SetAlertsHandler(fn func(Alert)) {
+	s.alertsMu.Lock()
+	s.alertsHandler = fn
+	s.alertsMu.Unlock()
+}
+
+func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var alert Alert
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&alert); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, map[string]any{"status": "ok", "received": len(alert.Alerts)})
+	s.alertsMu.RLock()
+	fn := s.alertsHandler
+	s.alertsMu.RUnlock()
+	if fn != nil && len(alert.Alerts) > 0 {
+		fn(alert)
+	}
 }
 
 // Run блокирует до отмены контекста, затем корректно завершает сервер.
