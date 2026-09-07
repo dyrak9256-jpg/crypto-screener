@@ -21,6 +21,21 @@ import (
 func setupTestPostgres(t *testing.T) (*Repository, func()) {
 	t.Helper()
 
+	// Приоритет 1: внешний инстанс из TEST_DATABASE_URL (быстрее контейнера;
+	// схема применяется автоматически, таблицы чистятся — тесты ожидают пустую БД).
+	if dsn := os.Getenv("TEST_DATABASE_URL"); dsn != "" {
+		repo, err := NewRepository(context.Background(), dsn)
+		if err != nil {
+			t.Fatalf("TEST_DATABASE_URL: подключение не удалось: %v", err)
+		}
+		if _, err := repo.pool.Exec(context.Background(),
+			`TRUNCATE signals, users, settings`); err != nil {
+			repo.Close()
+			t.Fatalf("TEST_DATABASE_URL: очистка таблиц не удалась: %v", err)
+		}
+		return repo, func() { repo.Close() }
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
@@ -209,9 +224,13 @@ func TestPostgresRepository_Signals_Upsert(t *testing.T) {
 	assert.Equal(t, "BINANCE", dbExA)
 	assert.Equal(t, "BYBIT", dbExB)
 	assert.True(t, dbIsActive)
-	assert.Equal(t, "0.02500000", dbInitialSpread)
-	assert.Equal(t, "0.02500000", dbPeakSpread)
-	assert.Equal(t, "0.00000000", dbFinalSpread)
+	// Числовые колонки сравниваем как decimal: pgx возвращает NUMERIC-ноль
+	// без хвостовых нулей ("0" вместо "0.00000000") — текстовое сравнение хрупко.
+	assert.True(t, decimal.RequireFromString(dbInitialSpread).Equal(decimal.RequireFromString("0.025")),
+		"initial_spread: %s", dbInitialSpread)
+	assert.True(t, decimal.RequireFromString(dbPeakSpread).Equal(decimal.RequireFromString("0.025")),
+		"peak_spread: %s", dbPeakSpread)
+	assert.True(t, decimal.RequireFromString(dbFinalSpread).IsZero(), "final_spread: %s", dbFinalSpread)
 	assert.Equal(t, int64(0), dbDurationMs)
 
 	// 2. UPSERT: Update Peak Spread while still active
