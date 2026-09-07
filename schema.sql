@@ -48,3 +48,13 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS buy_funding_rate NUMERIC(20, 12) NO
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_funding_rate NUMERIC(20, 12) NOT NULL DEFAULT 0;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS buy_next_funding_at TIMESTAMPTZ;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_next_funding_at TIMESTAMPTZ;
+
+-- Настройки оператора (персистентность /sethardspread и /setfees между рестартами).
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Мульти-ботовый режим: какой бот обслуживает пользователя.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_id BIGINT NOT NULL DEFAULT 0;

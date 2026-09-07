@@ -9,7 +9,7 @@ import (
 )
 
 func TestBot_NewBot_EmptyToken(t *testing.T) {
-	bot, err := NewBot("", nil)
+	bot, err := NewBot(0, "", nil)
 	require.Error(t, err)
 	require.Nil(t, bot)
 }

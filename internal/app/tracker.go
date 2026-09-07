@@ -2,12 +2,13 @@ package app
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
 
 	"crypto-screener/internal/domain"
+	"crypto-screener/internal/observability"
 )
 
 type Tracker struct {
@@ -20,6 +21,16 @@ type Tracker struct {
 
 func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSignal, router *NotificationRouter) *Tracker {
 	return &Tracker{activeSignals: make(map[string]*domain.ArbitrageSignal), config: cfg, dbChan: dbChan, router: router}
+}
+
+// ActiveCount возвращает количество активных сигналов (для метрик/статуса).
+func (t *Tracker) ActiveCount() int {
+	if t == nil {
+		return 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.activeSignals)
 }
 
 func signalKey(e domain.SpreadEvent) string {
@@ -95,12 +106,21 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 	}
 	t.mu.Unlock()
 
+	if notify != nil {
+		if opened {
+			observability.SignalOpened()
+		} else {
+			observability.SignalClosed()
+		}
+	}
+
 	if persist != nil && t.dbChan != nil {
 		// Lifecycle/peak events are rare and must not be silently dropped. The
 		// bounded queue normally accepts immediately; a sustained DB outage is
 		// given a finite grace period so market-data workers are not blocked forever.
 		if err := t.enqueuePersistence(persist, 5*time.Second); err != nil {
-			log.Printf("❌ tracker persistence enqueue signal %s: %v", persist.ID, err)
+			observability.DBError()
+			slog.Error("tracker: persistence enqueue failed", "signal_id", persist.ID, "error", err)
 		}
 	}
 	if notify != nil && t.router != nil {

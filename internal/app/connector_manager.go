@@ -4,7 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,7 +32,7 @@ func newConnectorEntry(ctx context.Context, name string, conn domain.ExchangeCon
 			defer e.wg.Done()
 			if err := fn(entryCtx); err != nil && entryCtx.Err() == nil {
 				wrapped := fmt.Errorf("connector %s/%s: %w", name, label, err)
-				log.Printf("⚠️ [%s/%s] stopped with error: %v", name, label, wrapped)
+				slog.Warn("connector stream stopped with error", "connector", name, "stream", label, "error", wrapped)
 			}
 		}()
 	}
@@ -120,6 +121,31 @@ func NewConnectorManager(tickChan chan<- domain.MarketTick, fundingSink domain.F
 	return cm
 }
 
+// Count возвращает количество активных коннекторов бирж (для метрик/статуса).
+func (cm *ConnectorManager) Count() int {
+	if cm == nil {
+		return 0
+	}
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return len(cm.entries)
+}
+
+// Names возвращает отсортированный список активных бирж (для /api/status).
+func (cm *ConnectorManager) Names() []string {
+	if cm == nil {
+		return nil
+	}
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	names := make([]string, 0, len(cm.entries))
+	for name := range cm.entries {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 var ErrManagerStopped = errors.New("connector manager is stopped")
 
 func (cm *ConnectorManager) AddConnector(parentCtx context.Context, name string, conn domain.ExchangeConnector) error {
@@ -157,7 +183,7 @@ func (cm *ConnectorManager) AddConnector(parentCtx context.Context, name string,
 	cm.mu.Lock()
 	cm.entries[name] = entry
 	cm.mu.Unlock()
-	log.Printf("✅ [%s] connector started", name)
+	slog.Info("connector started", "connector", name)
 	return nil
 }
 
@@ -190,7 +216,7 @@ func (cm *ConnectorManager) RemoveConnector(name string) error {
 		delete(cm.entries, name)
 	}
 	cm.mu.Unlock()
-	log.Printf("🛑 [%s] connector stopped cleanly", name)
+	slog.Info("connector stopped cleanly", "connector", name)
 	return nil
 }
 
@@ -226,7 +252,7 @@ func (cm *ConnectorManager) StopAll() error {
 		if len(all) > 0 {
 			cm.stopErr = fmt.Errorf("connector shutdown incomplete: %s", strings.Join(all, "; "))
 		} else {
-			log.Println("✅ ConnectorManager: all connectors stopped")
+			slog.Info("ConnectorManager: all connectors stopped")
 		}
 	})
 	<-cm.stopDone

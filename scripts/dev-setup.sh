@@ -22,7 +22,9 @@
 # ставится Go и зависимости, а для PostgreSQL выводится инструкция.
 #
 # Крединалы БД можно переопределить через переменные окружения:
-#   DB_USER / DB_PASSWORD / DB_NAME (по умолчанию screener_user/change_me/screener_db)
+#   DB_USER / DB_NAME (по умолчанию screener_user/screener_db).
+# Пароль БД, если не задан явно, генерируется случайно и вписывается в .env
+# (никаких change_me по умолчанию).
 # ============================================================================
 set -euo pipefail
 
@@ -43,7 +45,12 @@ for arg in "$@"; do
 done
 
 DB_USER="${DB_USER:-screener_user}"
-DB_PASSWORD="${DB_PASSWORD:-change_me}"
+GENERATED_DB_PASSWORD=0
+if [ -z "${DB_PASSWORD:-}" ]; then
+  # Случайный пароль: base64 без спецсимволов, безопасен для sed/psql/URL.
+  DB_PASSWORD="$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)"
+  GENERATED_DB_PASSWORD=1
+fi
 DB_NAME="${DB_NAME:-screener_db}"
 
 # ---------- утилиты ----------
@@ -136,6 +143,11 @@ fi
 if [ ! -f .env ]; then
   log "Создание .env из .env.example (заполни TELEGRAM_TOKEN и ADMIN_CHAT_IDS!)"
   cp .env.example .env
+  if [ "$GENERATED_DB_PASSWORD" -eq 1 ]; then
+    sed -i "s|^DB_PASSWORD=.*|DB_PASSWORD=${DB_PASSWORD}|" .env
+    sed -i "s|^DATABASE_URL=.*|DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD}@localhost:5432/${DB_NAME}?sslmode=disable|" .env
+    log "Сгенерирован случайный пароль БД и вписан в .env"
+  fi
 fi
 
 # ---------- 5. Проверочный гейт ----------
