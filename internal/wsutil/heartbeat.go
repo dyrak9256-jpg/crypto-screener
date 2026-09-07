@@ -28,14 +28,12 @@ func StartHeartbeat(ctx context.Context, conn *websocket.Conn, interval, readTim
 	if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 		return fmt.Errorf("set websocket read deadline: %w", err)
 	}
-	if err := conn.SetPongHandler(func(string) error {
+	conn.SetPongHandler(func(string) error {
 		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 			return fmt.Errorf("refresh websocket read deadline after pong: %w", err)
 		}
 		return nil
-	}); err != nil {
-		return fmt.Errorf("set websocket pong handler: %w", err)
-	}
+	})
 
 	go func() {
 		ticker := time.NewTicker(interval)

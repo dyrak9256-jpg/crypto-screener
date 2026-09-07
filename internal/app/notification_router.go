@@ -199,7 +199,7 @@ func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOp
 
 	job := notificationJob{text: text, chatIDs: append([]int64(nil), targets...)}
 	nr.mu.RLock()
-	closed := nr.closed
+	closed = nr.closed
 	nr.mu.RUnlock()
 	if closed {
 		return nil

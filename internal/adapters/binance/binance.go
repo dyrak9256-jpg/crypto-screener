@@ -276,6 +276,7 @@ func (a *Adapter) connectAndRead(
 		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
 			return fmt.Errorf("set pong read deadline: %w", err)
 		}
+		return nil
 	})
 
 	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
@@ -390,6 +391,7 @@ func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.Funding
 		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
 			return fmt.Errorf("set pong read deadline: %w", err)
 		}
+		return nil
 	})
 
 	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
@@ -408,7 +410,7 @@ func (a *Adapter) connectAndReadFunding(ctx context.Context, sink domain.Funding
 		}
 
 		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
-			return fmt.Errorf("refresh Binance %s read deadline: %w", mType, err)
+			return fmt.Errorf("refresh Binance funding read deadline: %w", err)
 		}
 
 		var payloads []fundingPayload

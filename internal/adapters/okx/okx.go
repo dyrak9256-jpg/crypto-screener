@@ -55,12 +55,14 @@ type wsResponse struct {
 }
 
 type tickerData struct {
-	InstID    string `json:"instId"`
-	LastPx    string `json:"last"`
-	BidPx     string `json:"bidPx"`
-	AskPx     string `json:"askPx"`
-	VolCcy24h string `json:"volCcy24h"`
-	Ts        int64  `json:"ts,string"`
+	InstID          string `json:"instId"`
+	LastPx          string `json:"last"`
+	BidPx           string `json:"bidPx"`
+	AskPx           string `json:"askPx"`
+	VolCcy24h       string `json:"volCcy24h"`
+	FundingRate     string `json:"fundingRate"`
+	NextFundingTime int64  `json:"nextFundingTime,string"`
+	Ts              int64  `json:"ts,string"`
 }
 
 type Adapter struct {

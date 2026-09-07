@@ -18,15 +18,24 @@ func TestNotificationRouter_FilteringAndCloseRecipients(t *testing.T) {
 	um.SetUser(&domain.User{ChatID: 1, MinSpread: decimal.RequireFromString("0.02"), MinVolume: decimal.RequireFromString("1000"), Timeframe: domain.TF_24h})
 	um.SetUser(&domain.User{ChatID: 2, MinSpread: decimal.RequireFromString("0.04"), MinVolume: decimal.RequireFromString("1000"), Timeframe: domain.TF_24h})
 	tg := mocks.NewMockTelegramSender(ctrl)
-	tg.EXPECT().Broadcast(gomock.Any(), []int64{1}).Times(1)
-	tg.EXPECT().Broadcast(gomock.Any(), []int64{1}).Times(1)
+	broadcasts := make(chan struct{}, 2)
+	tg.EXPECT().Broadcast(gomock.Any(), []int64{1}).Times(2).Do(func(_ string, _ []int64) { broadcasts <- struct{}{} })
 	r := NewNotificationRouter(um, tg)
 	defer r.Close()
 	s := &domain.ArbitrageSignal{Symbol: "BTCUSDT", PeakSpread: decimal.RequireFromString("0.03"), InitialSpread: decimal.RequireFromString("0.03"), QuoteVolume: decimal.RequireFromString("5000"), OpenedAt: time.Now()}
 	ids := r.ProcessSignal(s, true)
 	require.Equal(t, []int64{1}, ids)
 	s.NotifiedChatIDs = ids
-	r.ProcessSignal(s, false)
+	require.Equal(t, []int64{1}, r.ProcessSignal(s, false))
+	// Delivery happens asynchronously in worker goroutines: wait for both the
+	// OPEN and the CLOSE broadcast before Close() can race the delivery.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-broadcasts:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("broadcast %d was not delivered", i+1)
+		}
+	}
 }
 
 func TestNotificationRouter_NilTelegramSafe(t *testing.T) {
@@ -40,7 +49,8 @@ func TestNotificationRouter_FundingTimeFilter(t *testing.T) {
 	um := domain.NewUserManager()
 	tg := mocks.NewMockTelegramSender(gomock.NewController(t))
 	um.SetUser(&domain.User{ChatID: 7, MinSpread: decimal.RequireFromString("0.01"), MinVolume: decimal.Zero, Timeframe: domain.TF_24h, MinFundingMinutes: 30})
-	tg.EXPECT().Broadcast(gomock.Any(), []int64{7}).Times(1)
+	broadcast := make(chan []int64, 1)
+	tg.EXPECT().Broadcast(gomock.Any(), []int64{7}).Times(1).Do(func(_ string, ids []int64) { broadcast <- ids })
 	r := NewNotificationRouter(um, tg)
 	defer r.Close()
 	now := time.Date(2026, 9, 7, 4, 0, 0, 0, time.UTC)
@@ -50,6 +60,14 @@ func TestNotificationRouter_FundingTimeFilter(t *testing.T) {
 	ok := tooSoon.Snapshot()
 	ok.SellNextFunding = now.Add(31 * time.Minute)
 	require.Equal(t, []int64{7}, r.ProcessSignal(ok, true))
+	// The router delivers asynchronously via worker goroutines: wait for the
+	// actual Broadcast before Close() can race the delivery.
+	select {
+	case ids := <-broadcast:
+		require.Equal(t, []int64{7}, ids)
+	case <-time.After(2 * time.Second):
+		t.Fatal("broadcast was not delivered")
+	}
 }
 
 func TestNotificationRouter_TargetsAreComputedWithoutTelegramTransport(t *testing.T) {

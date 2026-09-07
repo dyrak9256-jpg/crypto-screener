@@ -14,7 +14,7 @@ func tick(ex string, mt domain.MarketType, bid, ask string, ts time.Time) domain
 func seedFunding(t *testing.T, fm *FundingManager, now time.Time) {
 	t.Helper()
 	require.NoError(t, fm.UpdateFunding("BINANCE", "BTCUSDT", decimal.RequireFromString("0.001"), now.Add(time.Hour), now))
-	require.NoError(t, fm.UpdateFunding("BYBIT", "BTCUSDT", decimal.RequireFromString("0.001"), now.Add(time.Hour), now))
+	require.NoError(t, fm.UpdateFunding("BYBIT", "BTCUSDT", decimal.RequireFromString("0.002"), now.Add(time.Hour), now))
 }
 func TestShardedAggregator_AllProfitableCrossExchangePairs(t *testing.T) {
 	cfg := domain.NewScreenerConfig(decimal.RequireFromString("0.01"))

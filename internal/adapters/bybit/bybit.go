@@ -540,3 +540,34 @@ func (a *Adapter) readCandleConnection(ctx context.Context, sink domain.CandleSi
 		}
 	}
 }
+
+func toMarketTick(p *tickerPayload, mType domain.MarketType, ts time.Time) (domain.MarketTick, bool) {
+	bid, err := decimal.NewFromString(p.Bid1)
+	if err != nil || bid.IsZero() {
+		return domain.MarketTick{}, false
+	}
+
+	ask, err := decimal.NewFromString(p.Ask1)
+	if err != nil || ask.IsZero() || bid.GreaterThan(ask) {
+		return domain.MarketTick{}, false
+	}
+
+	qVol, _ := decimal.NewFromString(p.TurnOver)
+
+	return domain.MarketTick{
+		Exchange:    "BYBIT",
+		Symbol:      p.Symbol,
+		MarketType:  mType,
+		BestBid:     bid,
+		BestAsk:     ask,
+		QuoteVolume: qVol,
+		EventTime:   ts,
+		ReceivedAt:  time.Now(),
+		Timestamp:   ts,
+	}, true
+}
+
+func closeOnCtx(ctx context.Context, conn *websocket.Conn) {
+	<-ctx.Done()
+	conn.Close()
+}

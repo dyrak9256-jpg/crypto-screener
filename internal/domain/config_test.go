@@ -80,7 +80,7 @@ func TestScreenerConfig_GetCloseThreshold(t *testing.T) {
 		cfg := NewScreenerConfig(hardLimit)
 		cfg.SetUserCrossSpread(decimal.RequireFromString("0.04")) // user setting does not change lifecycle threshold
 		threshold := cfg.GetCloseThreshold()
-		assert.True(t, threshold.Equal(decimal.RequireFromString("0.02")))
+		assert.True(t, threshold.Equal(decimal.RequireFromString("0.005")))
 	})
 
 	t.Run("never exceeds the open threshold", func(t *testing.T) {

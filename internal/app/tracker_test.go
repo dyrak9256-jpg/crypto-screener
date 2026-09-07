@@ -20,6 +20,9 @@ func TestTracker_LifecycleAndPeakPersistence(t *testing.T) {
 	require.True(t, open.IsActive)
 	tr.HandleEvent(domain.SpreadEvent{Symbol: "BTCUSDT", SpreadType: domain.CrossExchange, Spread: decimal.RequireFromString("0.07"), BuyExchange: "BINANCE", SellExchange: "BYBIT", BuyMarket: domain.MarketTypeFutures, SellMarket: domain.MarketTypeFutures, Timestamp: t0.Add(10 * time.Second), Lifecycle: domain.SignalUpdated})
 	require.Len(t, db, 1)
+	updated := <-db
+	require.True(t, updated.IsActive)
+	require.True(t, updated.PeakSpread.Equal(decimal.RequireFromString("0.07")))
 	tr.HandleEvent(domain.SpreadEvent{Symbol: "BTCUSDT", SpreadType: domain.CrossExchange, Spread: decimal.Zero, BuyExchange: "BINANCE", SellExchange: "BYBIT", BuyMarket: domain.MarketTypeFutures, SellMarket: domain.MarketTypeFutures, Timestamp: t0.Add(45 * time.Second), Lifecycle: domain.SignalClosed})
 	require.Len(t, db, 1)
 	closed := <-db
