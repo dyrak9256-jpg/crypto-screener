@@ -2,7 +2,8 @@
 
 > Основа: живые находки аудита [07-audit-2026-09-08.md](07-audit-2026-09-08.md) (smoke-прогон + зонды биржевых API).
 > Каждый пункт снабжён точным диагнозом и рецептом — реализация не требует повторного расследования.
-> Статусы: ⬜ не начато · все пункки открыты.
+> Статусы: ⬜ не начато · 🔧 в работе · ✅ готово.
+> Обновление 08.09.2026 (вечер): §1 и §2 (вариант A) — ✅ реализованы, см. ветку `feat/adapters-grafana`.
 
 ---
 
@@ -14,26 +15,35 @@
 
 ---
 
-## 1. P0 — Фиксы биржевых адаптеров (данные уже ждут)
+## 1. P0 — Фиксы биржевых адаптеров (данные уже ждут) — ✅ ГОТОВО (08.09.2026)
 
 Приоритет внутри: сначала бесплатные фиксы, потом средние.
 
-| # | Биржа | Дефект (диагноз подтверждён живым API) | Рецепт | Усилие |
-|---|---|---|---|---|
-| 1 | **Bitget** | `contract/detail`: поля `contractStatus` больше нет — теперь `symbolStatus` (значения `"normal"`, 780 контрактов) → фьючерсная подписка пустая, спот при этом работает | Переименовать поле в `fetchFuturesSymbols` (`bitget.go:356`); регресс-тест на живой JSON | XS |
-| 2 | **KuCoin** | `/api/ua/v2/market/funding-rate`: `nextFundingRate` теперь строка `"0.00005"` → декод падает каждые 10с | Тип поля → `decimal.Decimal` (shopspring парсит строку сам) в `pollFunding` (`kucoin.go:113`) | XS |
-| 3 | **MEXC** | `/api/v3/exchangeInfo`: `status` теперь строка `"1"` → списки символов не грузятся (спот-тики + funding-цикл) | Парсить `status` как строку, активна = `"1"` (`mexc.go` mexcSpotInfo) | XS |
-| 4 | **OKX** | Подписка `{channel:"tickers", instType:…}` без `instId` → биржа отвечает `event:"error" 60018`, код молчит → 0 тиков. Зонд: подписка с `instId` тикает | ① формировать args с конкретными instId батчами (список уже есть — `instruments`); ② **логировать `event:"error"`** ответы OKX (`okx.go` чтение) | S |
-| 5 | **Gate.io** | ① спот: `result` апдейта — одиночный объект, код ждёт массив → unmarshal-ошибка на каждом сообщении; ② фьючерсы: канал `futures.tickers` не содержит bid/ask (там last/volume/funding) → все тики отбракованы | ① спот: `Result tickerData` (объект) вместо среза; ② фьючерсы: перейти на канал `futures.book_ticker` (структура `{contract, b, B, a, A, t, u}` — как у спота, зонд подтвердил формат у `spot.book_ticker`); валидировать ack-ошибки (`result.error`) | M |
-| 6 | **BingX** | ① `/spot/v1/common/symbols`: `data` теперь объект `{"symbols":[…],…}`, `status` — int → списки не грузятся; ② `/swap/v2/quote/fundingRate` без параметра `symbol` → 109400 | ① новая структура ответа; ② поллить funding по символам (по образцу MEXC, с ограничением速率) или найти batch-эндпоинт | M |
+**Итог smoke 40с после фиксов**: тики с **5 бирж** — BITGET 445 756 · OKX 101 584 · BINGX 98 823 · GATEIO 56 668 · KUCOIN 23 547 (~725K тиков суммарно); funding жив у 6 (BINANCE/BYBIT — гео-блок REST, ожидаемо). Binance — только со сменой региона/прокси; Bybit — см. P1-3 (кэш символов).
 
-**После фиксов**: `./cmd/smoke` + `screener_ticks_total{exchange=…}` покажут 7/8 бирж (Binance — только со сменой региона/прокси).
+| # | Биржа | Статус | Дефект (диагноз подтверждён живым API) | Рецепт | Усилие |
+|---|---|---|---|---|---|
+| 1 | **Bitget** | ✅ | `contract/detail`: поля `contractStatus` больше нет — теперь `symbolStatus` (значения `"normal"`, 780 контрактов) → фьючерсная подписка пустая, спот при этом работает | Переименовать поле в `fetchFuturesSymbols` (`bitget.go:356`); регресс-тест на живой JSON | XS |
+| 2 | **KuCoin** | ✅ | `/api/ua/v2/market/funding-rate`: `nextFundingRate` теперь строка `"0.00005"` → декод падает каждые 10с | Тип поля → `decimal.Decimal` (shopspring парсит строку сам) в `pollFunding` (`kucoin.go:113`) | XS |
+| 3 | **MEXC** | ✅ | `/api/v3/exchangeInfo`: `status` теперь строка `"1"` → списки символов не грузятся (спот-тики + funding-цикл) | Парсить `status` как строку, активна = `"1"` (`mexc.go` mexcSpotInfo) | XS |
+| 4 | **OKX** | ✅ | Подписка `{channel:"tickers", instType:…}` без `instId` → биржа отвечает `event:"error" 60018`, код молчит → 0 тиков. Зонд: подписка с `instId` тикает | ① формировать args с конкретными instId батчами (список уже есть — `instruments`); ② **логировать `event:"error"`** ответы OKX (`okx.go` чтение) | S |
+| 5 | **Gate.io** | ✅ | ① спот: `result` апдейта — одиночный объект, код ждёт массив → unmarshal-ошибка на каждом сообщении; ② фьючерсы: канал `futures.tickers` не содержит bid/ask (там last/volume/funding) → все тики отбракованы | ① спот: `Result tickerData` (объект) вместо среза; ② фьючерсы: перейти на канал `futures.book_ticker` (структура `{contract, b, B, a, A, t, u}` — как у спота, зонд подтвердил формат у `spot.book_ticker`); валидировать ack-ошибки (`result.error`) | M |
+| 6 | **BingX** | ✅ | ① `/spot/v1/common/symbols`: `data` теперь объект `{"symbols":[…],…}`, `status` — int → списки не грузятся; ② `/swap/v2/quote/fundingRate` без параметра `symbol` → 109400 | ① новая структура ответа; ② поллить funding по символам (по образцу MEXC, с ограничением速率) или найти batch-эндпоинт | M |
+
+**Как реализовано (важные отличия от исходных рецептов)**:
+- **BingX**: старые каналы `spot.tickers`/`swap.tickers` мертвы (100400/80015) — тикеры переведены на **шардированные по-символьные подписки** `SYM@bookTicker` (BBO) + `SYM@ticker` (quote-объём) с мержем по символу, ~100 символов на соединение; funding — bulk-эндпоинт `/swap/v2/quote/premiumIndex` (одним запросом по всем контрактам).
+- **Gate.io**: фьючерсы подписаны на `futures.book_ticker` (BBO) + `futures.tickers` (объём) с мержем; ack-ошибки логируются.
+- Все форматы зафиксированы регресс-тестами (`*_test.go: TestWsUpdateFormats`) на живые JSON-сэмплы от 08.09.2026.
+
+**После фиксов**: `./cmd/smoke` + `screener_ticks_total{exchange=…}` показывают 5/8 бирж (Binance — только со сменой региона/прокси, Bybit — P1-3, MEXC-WS — WAF песочницы, на проде должен тикать).
 
 **Бонус-пункт (Bybit)**: сам WS `stream.bybit.com` доступен даже из REST-блокированного региона (зонд: тики BTCUSDT идут). Кэш символов на диск (см. P1-3) оживит Bybit без прокси.
 
 ---
 
-## 2. P0 — Панель мониторинга (дашборд)
+## 2. P0 — Панель мониторинга (дашборд) — ✅ ГОТОВО, вариант A (08.09.2026)
+
+**Реализовано** (`observability/` в репозитории): `prometheus.yml` (scrape app:9090 каждые 15с + self), `alerts.yml` (ScreenerDown, ExchangeSilent >5мин, FundingStale >120с, TelegramDropped >0/10мин, DbErrors >0/10мин), `grafana/provisioning/` (datasource + провайдер дашбордов), `grafana/dashboards/crypto-screener.json` (13 панелей: статы тиков/сигналов/дропов/ошибок, тики по биржам, funding age, сигналы, Telegram, очереди, алерт-лист, heap/goroutines) + сервисы `prometheus` (порт 9091) и `grafana` (порт 3000, анонимный Viewer) в `docker-compose.yml`. Запуск: `docker compose up -d prometheus grafana` → http://localhost:3000. Доставка алертов в Telegram — следующий шаг (нужен Alertmanager, см. P1).
 
 **Сейчас есть** (без панели): `GET /metrics` (Prometheus), `GET /api/status` (JSON: очереди, активные сигналы, funding-возраст, доступность бирж), `GET /healthz`, `/debug/pprof`. Данные полные — визуального слоя нет.
 

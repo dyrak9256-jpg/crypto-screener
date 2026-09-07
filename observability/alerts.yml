@@ -1,0 +1,48 @@
+# Правила алертов crypto-screener (Prometheus).
+# Пороги соответствуют docs/08-improvements-next.md §2:
+# биржа молчит >5 мин, funding_age >120 с, telegram dropped >0/10 мин, db_errors >0/10 мин.
+groups:
+  - name: crypto-screener
+    rules:
+      - alert: ScreenerDown
+        expr: up{job="screener"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Скринер недоступен"
+          description: "Prometheus больше минуты не может получить /metrics (up == 0). Проверить контейнер app."
+
+      - alert: ExchangeSilent
+        expr: sum by (exchange) (rate(screener_ticks_total[5m])) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Биржа {{ $labels.exchange }} молчит"
+          description: "Ноль тиков от {{ $labels.exchange }} за последние 5 минут. Вероятно, отвалился WS-коннект или биржа сменила протокол."
+
+      - alert: FundingStale
+        expr: screener_funding_age_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Устаревший funding на {{ $labels.exchange }}"
+          description: "Возраст последнего funding-апдейта {{ $labels.exchange }} превышает 120 с более 2 минут."
+
+      - alert: TelegramDropped
+        expr: increase(screener_telegram_dropped_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Telegram-уведомления теряются"
+          description: "За последние 10 минут отброшено уведомлений: {{ $value }} (переполнение очереди или ошибка отправки)."
+
+      - alert: DbErrors
+        expr: increase(screener_db_errors_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ошибки записи в БД"
+          description: "За последние 10 минут ошибок записи: {{ $value }}. Проверить PostgreSQL."

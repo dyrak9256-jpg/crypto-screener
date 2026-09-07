@@ -491,8 +491,10 @@ type mexcCandleResponse struct {
 
 type mexcSpotInfo struct {
 	Symbols []struct {
-		Symbol     string `json:"symbol"`
-		Status     int    `json:"status"`
+		Symbol string `json:"symbol"`
+		// MEXC сменил тип status с int на строку ("1" = активна) —
+		// подтверждено живым API 08.09.2026.
+		Status     string `json:"status"`
 		QuoteAsset string `json:"quoteAsset"`
 	} `json:"symbols"`
 }
@@ -606,7 +608,7 @@ func mexcCandleSymbols(ctx context.Context, spot bool) ([]string, error) {
 		}
 		out := make([]string, 0, len(x.Symbols))
 		for _, v := range x.Symbols {
-			if v.QuoteAsset == "USDT" && v.Status == 1 {
+			if v.QuoteAsset == "USDT" && v.Status == "1" {
 				out = append(out, v.Symbol)
 			}
 		}

@@ -50,6 +50,8 @@ type argItem struct {
 
 type wsResponse struct {
 	Event string       `json:"event,omitempty"`
+	Code  string       `json:"code,omitempty"`
+	Msg   string       `json:"msg,omitempty"`
 	Arg   argItem      `json:"arg"`
 	Data  []tickerData `json:"data"`
 }
@@ -269,7 +271,20 @@ func (a *Adapter) connectAndRead(
 
 	log.Printf("✅ OKX %s connected", mType)
 
-	args := []argItem{{Channel: "tickers", InstType: instType}}
+	// Канал tickers требует конкретный instId: подписка "по типу инструмента"
+	// отклоняется биржей (event:error code 60018) и данные не приходят.
+	// Подтверждено живым API 08.09.2026 — аудит docs/07.
+	rawIDs, err := okxTickerInstIDs(ctx, instType)
+	if err != nil {
+		return fmt.Errorf("load instruments for tickers: %w", err)
+	}
+	if len(rawIDs) == 0 {
+		return fmt.Errorf("no live USDT instruments for %s", instType)
+	}
+	args := make([]argItem, 0, len(rawIDs))
+	for _, id := range rawIDs {
+		args = append(args, argItem{Channel: "tickers", InstID: id})
+	}
 	for i := 0; i < len(args); i += 100 {
 		end := i + 100
 		if end > len(args) {
@@ -312,6 +327,14 @@ func (a *Adapter) connectAndRead(
 
 		var resp wsResponse
 		if err := sonic.Unmarshal(msg, &resp); err != nil {
+			continue
+		}
+
+		// OKX подтверждает подписки событием subscribe и отклоняет ошибочные
+		// событием error. Раньше ошибки подписки молча терялись — теперь они
+		// видны в логах сразу (см. аудит docs/07: code 60018 игнорировался).
+		if resp.Event == "error" {
+			log.Printf("⚠️ OKX %s subscription rejected: code=%s msg=%s arg=%+v", mType, resp.Code, resp.Msg, resp.Arg)
 			continue
 		}
 
@@ -483,6 +506,48 @@ func (a *Adapter) runCandleFeed(ctx context.Context, sink domain.CandleSink, ins
 			return
 		}
 	}
+}
+
+// okxTickerInstIDs возвращает instId для подписки на канал tickers:
+// спот — только USDT-пары ("BTC-USDT"), фьючерсы — только USDT-свопы
+// ("BTC-USDT-SWAP"), state=live.
+func okxTickerInstIDs(ctx context.Context, instType string) ([]string, error) {
+	u := "https://www.okx.com/api/v5/public/instruments?instType=" + instType
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("okxTickerInstIDs: %w", err)
+	}
+	r, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("okxTickerInstIDs: %w", err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode < 200 || r.StatusCode >= 300 {
+		return nil, fmt.Errorf("okxTickerInstIDs: HTTP %s", r.Status)
+	}
+	var x okxInstrumentResponse
+	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+		return nil, fmt.Errorf("okxTickerInstIDs: %w", err)
+	}
+	if x.Code != "0" {
+		return nil, fmt.Errorf("okxTickerInstIDs: API code %s", x.Code)
+	}
+	out := make([]string, 0, len(x.Data))
+	for _, v := range x.Data {
+		if v.State != "live" {
+			continue
+		}
+		if instType == "SPOT" {
+			if v.QuoteCcy == "USDT" {
+				out = append(out, v.InstID)
+			}
+			continue
+		}
+		if strings.HasSuffix(v.InstID, "-USDT-SWAP") {
+			out = append(out, v.InstID)
+		}
+	}
+	return out, nil
 }
 
 func okxRawSwapSymbols(ctx context.Context) ([]string, error) {

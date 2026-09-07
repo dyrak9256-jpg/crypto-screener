@@ -47,20 +47,29 @@ type wsRequest struct {
 	Payload []string `json:"payload,omitempty"`
 }
 
-// ✅ Spot и Futures имеют разные структуры ответа
-type spotWsResponse struct {
-	Channel string       `json:"channel"`
-	Event   string       `json:"event"`  // "update" | "subscribe" | "pong"
-	Result  []tickerData `json:"result"` // ✅ массив, не объект
+// Живые форматы Gate.io WS v4 (подтверждены зондами 08.09.2026, аудит docs/07):
+//
+//	spot.tickers update     → result = ОДИНОЧНЫЙ объект (currency_pair, BBO, объём);
+//	futures.book_ticker upd → result = одиночный объект {t,u,s,b,B,a,A} (BBO, без объёма);
+//	futures.tickers update  → result = МАССИВ объектов (объём 24h, без BBO);
+//	ack любой подписки      → result = объект {"status":"success"} или {"error":{…}}.
+//
+// Поэтому общий конверт несёт result как json.RawMessage и диспетчеризует по channel.
+type gateWsEnvelope struct {
+	Channel string          `json:"channel"`
+	Event   string          `json:"event"`
+	Result  json.RawMessage `json:"result"`
 }
 
-type futuresWsResponse struct {
-	Channel string              `json:"channel"`
-	Event   string              `json:"event"`
-	Result  []futuresTickerData `json:"result"`
+type gateAck struct {
+	Status string `json:"status"`
+	Error  *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
-// Gate.io Spot ticker fields
+// Gate.io Spot ticker fields (spot.tickers, update)
 type tickerData struct {
 	CurrencyPair string `json:"currency_pair"` // "BTC_USDT"
 	HighestBid   string `json:"highest_bid"`
@@ -68,12 +77,21 @@ type tickerData struct {
 	QuoteVolume  string `json:"quote_volume"`
 }
 
-// Gate.io Futures ticker fields
-// Поля подтверждены документацией Gate.io Futures WS V4
+// Gate.io Futures book_ticker (BBO, без объёма).
+// B/A — размеры сторон: у фьючерсов Gate шлёт их числами, у спота строками;
+// json.RawMessage принимает любой тип и не ломает декод (важно: без этих
+// полей sonic кейс-инсенситивно матчит "B" в строковое поле "b" и падает).
+type bookTickerData struct {
+	Contract string          `json:"s"` // "BTC_USDT"
+	Bid      string          `json:"b"`
+	Ask      string          `json:"a"`
+	BidSize  json.RawMessage `json:"B"`
+	AskSize  json.RawMessage `json:"A"`
+}
+
+// Gate.io Futures tickers: только источник 24h quote-объёма (BBO отсутствует)
 type futuresTickerData struct {
 	Contract string `json:"contract"`         // "BTC_USDT"
-	Bid1     string `json:"highest_bid"`      // highest bid price
-	Ask1     string `json:"lowest_ask"`       // lowest ask price
 	Volume   string `json:"volume_24h_quote"` // quote-currency turnover
 }
 
@@ -240,27 +258,24 @@ func (a *Adapter) connectSpot(ctx context.Context, out chan<- domain.MarketTick)
 			return fmt.Errorf("refresh GateIO read deadline: %w", err)
 		}
 
-		var resp spotWsResponse
-		if err := sonic.Unmarshal(msg, &resp); err != nil {
+		var env gateWsEnvelope
+		if err := sonic.Unmarshal(msg, &env); err != nil {
 			continue
 		}
 
 		// ✅ Фильтруем: нужны только update от ticker канала
 		// Пропускаем: pong, subscribe-ack и другие служебные сообщения
-		if resp.Event != "update" || resp.Channel != "spot.tickers" {
+		if env.Event != "update" || env.Channel != "spot.tickers" {
 			continue
 		}
 
-		if len(resp.Result) == 0 {
+		var t tickerData
+		if err := sonic.Unmarshal(env.Result, &t); err != nil || t.CurrencyPair == "" {
 			continue
 		}
 
 		now := time.Now()
-		for i := range resp.Result {
-			tick, ok := spotTickerToTick(&resp.Result[i], now)
-			if !ok {
-				continue
-			}
+		if tick, ok := spotTickerToTick(&t, now); ok {
 			ingress.Submit(out, tick)
 		}
 	}
@@ -274,20 +289,30 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
+	// Мерж-состояние каналов: объём (futures.tickers) + BBO (futures.book_ticker).
+	// Локально на соединение: при реконнекте снапшот tickers приходит первым.
+	var volMu sync.RWMutex
+	volByContract := make(map[string]decimal.Decimal)
+
 	log.Printf("✅ Gate.io Futures connected")
 
 	symbols, err := a.getSymbols(ctx, false)
 	if err != nil {
 		return fmt.Errorf("fetch futures symbols: %w", err)
 	}
+	// Два канала на одном соединении: book_ticker даёт BBO (без объёма),
+	// tickers — 24h quote-объём (без BBO). Мержим по контракту в volByContract.
 	for i := 0; i < len(symbols); i += symbolBatchSize {
 		end := i + symbolBatchSize
 		if end > len(symbols) {
 			end = len(symbols)
 		}
-		sub := wsRequest{Time: time.Now().Unix(), Channel: "futures.tickers", Event: "subscribe", Payload: symbols[i:end]}
-		if err := conn.WriteJSON(sub); err != nil {
-			return fmt.Errorf("subscribe futures batch: %w", err)
+		batch := symbols[i:end]
+		if err := conn.WriteJSON(wsRequest{Time: time.Now().Unix(), Channel: "futures.book_ticker", Event: "subscribe", Payload: batch}); err != nil {
+			return fmt.Errorf("subscribe futures book_ticker batch: %w", err)
+		}
+		if err := conn.WriteJSON(wsRequest{Time: time.Now().Unix(), Channel: "futures.tickers", Event: "subscribe", Payload: batch}); err != nil {
+			return fmt.Errorf("subscribe futures tickers batch: %w", err)
 		}
 	}
 
@@ -314,27 +339,61 @@ func (a *Adapter) connectFutures(ctx context.Context, out chan<- domain.MarketTi
 			return fmt.Errorf("refresh GateIO read deadline: %w", err)
 		}
 
-		var resp futuresWsResponse
-		if err := sonic.Unmarshal(msg, &resp); err != nil {
+		var env gateWsEnvelope
+		if err := sonic.Unmarshal(msg, &env); err != nil {
 			continue
 		}
 
-		// ✅ Фильтруем только futures ticker updates
-		if resp.Event != "update" || resp.Channel != "futures.tickers" {
+		if env.Event != "update" {
+			// ack-и и pong пропускаем, но ошибки подписки логируем.
+			if env.Event == "subscribe" {
+				var ack gateAck
+				if sonic.Unmarshal(env.Result, &ack) == nil && ack.Error != nil {
+					log.Printf("⚠️ Gate.io futures subscribe rejected: channel=%s code=%d msg=%s", env.Channel, ack.Error.Code, ack.Error.Message)
+				}
+			}
 			continue
 		}
 
-		if len(resp.Result) == 0 {
-			continue
-		}
-
-		now := time.Now()
-		for i := range resp.Result {
-			tick, ok := futuresTickerToTick(&resp.Result[i], now)
-			if !ok {
+		switch env.Channel {
+		case "futures.tickers":
+			// Обновляем 24h quote-объём по контрактам.
+			var rows []futuresTickerData
+			if err := sonic.Unmarshal(env.Result, &rows); err != nil {
 				continue
 			}
-			ingress.Submit(out, tick)
+			for i := range rows {
+				if rows[i].Contract == "" {
+					continue
+				}
+				vol, err := decimal.NewFromString(rows[i].Volume)
+				if err != nil || vol.IsNegative() {
+					continue
+				}
+				volMu.Lock()
+				volByContract[rows[i].Contract] = vol
+				volMu.Unlock()
+			}
+			continue
+		case "futures.book_ticker":
+			// BBO-апдейт — источник эмиссии тика.
+			var b bookTickerData
+			if err := sonic.Unmarshal(env.Result, &b); err != nil || b.Contract == "" {
+				continue
+			}
+			now := time.Now()
+			if tick, ok := bookTickerToTick(&b, now); ok {
+				volMu.RLock()
+				vol := volByContract[b.Contract]
+				volMu.RUnlock()
+				if !vol.IsZero() {
+					tick.QuoteVolume = vol
+				}
+				ingress.Submit(out, tick)
+			}
+			continue
+		default:
+			continue
 		}
 	}
 }
@@ -368,19 +427,16 @@ func spotTickerToTick(d *tickerData, ts time.Time) (domain.MarketTick, bool) {
 	}, true
 }
 
-func futuresTickerToTick(d *futuresTickerData, ts time.Time) (domain.MarketTick, bool) {
-	bid, err := decimal.NewFromString(d.Bid1)
+// bookTickerToTick конвертирует BBO-апдейт futures.book_ticker в тик.
+// QuoteVolume дозаполняется вызывающим кодом из futures.tickers-состояния.
+func bookTickerToTick(d *bookTickerData, ts time.Time) (domain.MarketTick, bool) {
+	bid, err := decimal.NewFromString(d.Bid)
 	if err != nil || bid.IsZero() {
 		return domain.MarketTick{}, false
 	}
 
-	ask, err := decimal.NewFromString(d.Ask1)
+	ask, err := decimal.NewFromString(d.Ask)
 	if err != nil || ask.IsZero() || bid.GreaterThan(ask) {
-		return domain.MarketTick{}, false
-	}
-
-	qVol, err := decimal.NewFromString(d.Volume)
-	if err != nil {
 		return domain.MarketTick{}, false
 	}
 
@@ -390,7 +446,7 @@ func futuresTickerToTick(d *futuresTickerData, ts time.Time) (domain.MarketTick,
 		MarketType:  domain.MarketTypeFutures,
 		BestBid:     bid,
 		BestAsk:     ask,
-		QuoteVolume: qVol,
+		QuoteVolume: decimal.Zero, // дозаполняется из futures.tickers-состояния
 		EventTime:   ts,
 		ReceivedAt:  time.Now(),
 		Timestamp:   ts,

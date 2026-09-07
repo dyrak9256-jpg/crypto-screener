@@ -54,15 +54,27 @@ type subscribeMsg struct {
 	DataType string `json:"dataType"`
 }
 
-// BingX Spot и Futures используют разные имена полей
-type tickerData struct {
-	Symbol     string `json:"s"`          // "BTC-USDT" (Spot)
-	BidPr      string `json:"b"`          // BestBid (Spot)
-	AskPr      string `json:"a"`          // BestAsk (Spot)
-	BidPrice   string `json:"bidPrice"`   // BestBid (Futures)
-	AskPrice   string `json:"askPrice"`   // BestAsk (Futures)
-	TradePrice string `json:"tradePrice"` // Last price (Futures fallback)
-	QVolume    string `json:"q"`          // Quote volume
+// @bookTicker: BBO без объёма (одинаковый формат на споте и свопе).
+// b/a — строки у свопа, у спота встречаются числа; decimal парсит оба
+// варианта. B/A (размеры заявок) объявлены явно: без них sonic
+// кейс-инсенситивно матчит "B" в поле "b" и падает на числе.
+type bingxBookTicker struct {
+	Event     string          `json:"e"` // "bookTicker"
+	EventTime int64           `json:"E"`
+	Symbol    string          `json:"s"`
+	Bid       decimal.Decimal `json:"b"`
+	Ask       decimal.Decimal `json:"a"`
+	BidSize   json.RawMessage `json:"B"`
+	AskSize   json.RawMessage `json:"A"`
+}
+
+// @ticker: 24hTicker с quote-объёмом (поле q), без BBO — объём мержится
+// с BBO из @bookTicker.
+type bingxDayTicker struct {
+	Event       string          `json:"e"` // "24hTicker"
+	EventTime   int64           `json:"E"`
+	Symbol      string          `json:"s"`
+	QuoteVolume decimal.Decimal `json:"q"`
 }
 
 type Adapter struct {
@@ -89,7 +101,10 @@ func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) e
 	}
 }
 func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://open-api.bingx.com/openApi/swap/v2/quote/fundingRate", nil)
+	// Эндпоинт fundingRate без параметра symbol перестал отвечать данными
+	// (код 109400). PremiumIndex возвращает текущую ставку и время следующего
+	// сеттла сразу по всем контрактам — подтверждено живым API 08.09.2026.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex", nil)
 	if err != nil {
 		return fmt.Errorf("pollFunding: %w", err)
 	}
@@ -113,7 +128,7 @@ func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) erro
 	}
 	type row struct {
 		Symbol          string `json:"symbol"`
-		FundingRate     string `json:"fundingRate"`
+		LastFundingRate string `json:"lastFundingRate"`
 		NextFundingTime int64  `json:"nextFundingTime"`
 	}
 	var rows []row
@@ -131,7 +146,7 @@ func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) erro
 	}
 	now := time.Now()
 	for _, v := range rows {
-		rate, err := decimal.NewFromString(v.FundingRate)
+		rate, err := decimal.NewFromString(v.LastFundingRate)
 		if err != nil {
 			continue
 		}
@@ -144,32 +159,69 @@ func (a *Adapter) pollFunding(ctx context.Context, sink domain.FundingSink) erro
 }
 
 func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, spotWS, domain.MarketTypeSpot, out)
+	a.runTickerFeed(ctx, out, true)
 	return nil
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	a.listen(ctx, futuresWS, domain.MarketTypeFutures, out)
+	a.runTickerFeed(ctx, out, false)
 	return nil
 }
 
-func (a *Adapter) listen(
-	ctx context.Context,
-	url string,
-	mType domain.MarketType,
-	out chan<- domain.MarketTick,
-) {
+// bingxShardSymbols — символов на одно WS-соединение. Мульти-символьные
+// dataType (через пробел) не поддерживаются, старые каналы spot.tickers /
+// swap.tickers мертвы (зонды 08.09.2026): подписка строго по одному символу
+// на сообщение, поэтому соединения шардированы.
+const bingxShardSymbols = 100
+
+// runTickerFeed загружает список символов и раскладывает по шардам; каждый
+// шард — своё соединение со своим reconnect-циклом (по образцу свечей).
+func (a *Adapter) runTickerFeed(ctx context.Context, out chan<- domain.MarketTick, spot bool) {
+	mType := domain.MarketTypeFutures
+	if spot {
+		mType = domain.MarketTypeSpot
+	}
 	backoff := retry.New(reconnectDelay, 30*time.Second)
-	for {
-		startedAt := time.Now()
+	for ctx.Err() == nil {
+		symbols, err := bingxTickerSymbols(ctx, spot)
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Printf("⚠️  BingX %s ticker symbols: %v", mType, err)
+			}
+			if !backoff.Wait(ctx.Done()) {
+				return
+			}
+			continue
+		}
+		shards := (len(symbols) + bingxShardSymbols - 1) / bingxShardSymbols
+		log.Printf("✅ BingX %s: %d symbols → %d WS shards", mType, len(symbols), shards)
+		var wg sync.WaitGroup
+		for i := 0; i < len(symbols); i += bingxShardSymbols {
+			end := min(i+bingxShardSymbols, len(symbols))
+			part := append([]string(nil), symbols[i:end]...)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				a.runTickerShard(ctx, out, mType, part)
+			}()
+		}
+		wg.Wait()
 		if ctx.Err() != nil {
 			return
 		}
-		if err := a.connectAndRead(ctx, url, mType, out); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			log.Printf("⚠️  BingX %s WS: %v — reconnecting in %s", mType, err, reconnectDelay)
+		// Все шарды закрылись при живом контексте — пересобираем с backoff.
+		if !backoff.Wait(ctx.Done()) {
+			return
+		}
+	}
+}
+
+func (a *Adapter) runTickerShard(ctx context.Context, out chan<- domain.MarketTick, mType domain.MarketType, symbols []string) {
+	backoff := retry.New(reconnectDelay, 30*time.Second)
+	for ctx.Err() == nil {
+		startedAt := time.Now()
+		if err := a.readTickerShard(ctx, out, mType, symbols); err != nil && ctx.Err() == nil {
+			log.Printf("⚠️  BingX %s ticker WS: %v — reconnecting in %s", mType, err, reconnectDelay)
 		}
 		if time.Since(startedAt) >= 30*time.Second {
 			backoff.Reset()
@@ -180,12 +232,16 @@ func (a *Adapter) listen(
 	}
 }
 
-func (a *Adapter) connectAndRead(
+func (a *Adapter) readTickerShard(
 	ctx context.Context,
-	url string,
-	mType domain.MarketType,
 	out chan<- domain.MarketTick,
+	mType domain.MarketType,
+	symbols []string,
 ) error {
+	url := spotWS
+	if mType == domain.MarketTypeFutures {
+		url = futuresWS
+	}
 	conn, _, err := dialer.DialContext(ctx, url, nil)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
@@ -193,35 +249,36 @@ func (a *Adapter) connectAndRead(
 	conn.SetReadLimit(1 << 20)
 	defer conn.Close()
 
-	log.Printf("✅ BingX %s connected", mType)
-
-	dataType := "spot.tickers"
-	if mType == domain.MarketTypeFutures {
-		dataType = "swap.tickers"
-	}
-
-	sub := subscribeMsg{
-		ID:       fmt.Sprintf("sub-%d", time.Now().UnixNano()),
-		ReqType:  "sub",
-		DataType: dataType,
-	}
-	if err := a.writeJSON(conn, sub); err != nil {
-		return fmt.Errorf("subscribe: %w", err)
-	}
-
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	go closeOnCtx(connCtx, conn)
 
-	// Дедлайн: если сервер молчит дольше чем pingInterval+pongWait
-	// значит что-то пошло не так (соединение зависло)
+	// Подписка: один символ на сообщение, оба канала — @bookTicker (BBO)
+	// и @ticker (24h quote-объём).
+	id := time.Now().UnixNano()
+	for _, sym := range symbols {
+		for _, channel := range []string{"bookTicker", "ticker"} {
+			sub := subscribeMsg{
+				ID:       fmt.Sprintf("sub-%d", id),
+				ReqType:  "sub",
+				DataType: sym + "@" + channel,
+			}
+			id++
+			if err := a.writeJSON(conn, sub); err != nil {
+				return fmt.Errorf("subscribe %s: %w", sub.DataType, err)
+			}
+		}
+	}
+	log.Printf("✅ BingX %s ticker shard: %d symbols", mType, len(symbols))
+
+	// Мерж объёма: @ticker (q) держим по символу, @bookTicker эмиссирует
+	// тик с этим объёмом (до первого @ticker объём нулевой).
+	var volMu sync.RWMutex
+	volBySymbol := make(map[string]decimal.Decimal, len(symbols))
+
 	if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
 		return fmt.Errorf("set deadline: %w", err)
 	}
-
-	// ✅ Нет keepAlive горутины — BingX сам инициирует Ping
-	// Нам нужно только отвечать на серверный Ping
 
 	for {
 		_, msg, err := conn.ReadMessage()
@@ -231,23 +288,18 @@ func (a *Adapter) connectAndRead(
 			}
 			return fmt.Errorf("read: %w", err)
 		}
-
-		// Сбрасываем дедлайн при каждом сообщении
 		if err := conn.SetReadDeadline(time.Now().Add(pingInterval + pongWait)); err != nil {
 			return fmt.Errorf("refresh BingX read deadline: %w", err)
 		}
 
-		// Декомпрессия gzip
 		data, err := decompressGzip(msg)
 		if err != nil {
-			// Не gzip — используем как есть (служебные фреймы)
-			data = msg
+			data = msg // не gzip — служебный фрейм
 		}
 
 		strData := string(data)
 
-		// ✅ Критично: отвечаем на серверный Ping
-		// BingX разрывает соединение если не получает Pong
+		// BingX сам инициирует Ping и рвёт соединение без Pong.
 		if strData == "Ping" || strings.Contains(strData, `"ping"`) {
 			if err := a.writeMessage(conn, websocket.TextMessage, []byte("Pong")); err != nil {
 				return fmt.Errorf("write pong: %w", err)
@@ -256,56 +308,45 @@ func (a *Adapter) connectAndRead(
 		}
 
 		var raw struct {
-			DataType string       `json:"dataType"`
-			Data     []tickerData `json:"data"`
+			DataType string          `json:"dataType"`
+			Data     json.RawMessage `json:"data"`
 		}
-		if err := sonic.Unmarshal(data, &raw); err != nil {
-			continue
-		}
-
-		if len(raw.Data) == 0 {
+		if err := sonic.Unmarshal(data, &raw); err != nil || raw.DataType == "" {
 			continue
 		}
 
 		now := time.Now()
-		for i := range raw.Data {
-			tick, ok := toMarketTick(&raw.Data[i], mType, now)
-			if !ok {
+		switch {
+		case strings.HasSuffix(raw.DataType, "@bookTicker"):
+			var b bingxBookTicker
+			if err := sonic.Unmarshal(raw.Data, &b); err != nil {
 				continue
 			}
-			ingress.Submit(out, tick)
+			volMu.RLock()
+			vol := volBySymbol[b.Symbol]
+			volMu.RUnlock()
+			if tick, ok := bboToTick(&b, mType, now, vol); ok {
+				ingress.Submit(out, tick)
+			}
+		case strings.HasSuffix(raw.DataType, "@ticker"):
+			var d bingxDayTicker
+			if err := sonic.Unmarshal(raw.Data, &d); err != nil || d.Symbol == "" {
+				continue
+			}
+			volMu.Lock()
+			volBySymbol[d.Symbol] = d.QuoteVolume
+			volMu.Unlock()
 		}
 	}
 }
 
-func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.MarketTick, bool) {
-	// Spot: b / a; Futures: bidPrice / askPrice.
-	// Last-trade price is never substituted for BBO because that creates a
-	// non-executable arbitrage quote.
-	bidStr := d.BidPr
-	askStr := d.AskPr
-	if mType == domain.MarketTypeFutures {
-		bidStr = d.BidPrice
-		askStr = d.AskPrice
-	}
-
-	bid, err := decimal.NewFromString(bidStr)
-	if err != nil || bid.IsZero() {
+func bboToTick(b *bingxBookTicker, mType domain.MarketType, ts time.Time, vol decimal.Decimal) (domain.MarketTick, bool) {
+	if b.Symbol == "" || b.Bid.IsZero() || b.Ask.IsZero() || b.Bid.GreaterThan(b.Ask) {
 		return domain.MarketTick{}, false
 	}
 
-	ask, err := decimal.NewFromString(askStr)
-	if err != nil || ask.IsZero() || bid.GreaterThan(ask) {
-		return domain.MarketTick{}, false
-	}
-
-	qVol, err := decimal.NewFromString(d.QVolume)
-	if err != nil {
-		return domain.MarketTick{}, false
-	}
-
-	// ✅ Нормализация: "BTC-USDT" → "BTCUSDT"
-	symbol := strings.ReplaceAll(d.Symbol, "-", "")
+	// Нормализация: "BTC-USDT" → "BTCUSDT"
+	symbol := strings.ReplaceAll(b.Symbol, "-", "")
 	if !strings.HasSuffix(strings.ToUpper(symbol), "USDT") {
 		return domain.MarketTick{}, false
 	}
@@ -314,23 +355,13 @@ func toMarketTick(d *tickerData, mType domain.MarketType, ts time.Time) (domain.
 		Exchange:    "BINGX",
 		Symbol:      symbol,
 		MarketType:  mType,
-		BestBid:     bid,
-		BestAsk:     ask,
-		QuoteVolume: qVol,
+		BestBid:     b.Bid,
+		BestAsk:     b.Ask,
+		QuoteVolume: vol,
 		EventTime:   ts,
 		ReceivedAt:  time.Now(),
 		Timestamp:   ts,
 	}, true
-}
-
-// firstNonEmpty возвращает первую непустую строку из списка
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 // ✅ Исправленный порядок: Close → Put (не Put → Close)
@@ -396,12 +427,20 @@ type bingxCandleMessage struct {
 		} `json:"K"`
 	} `json:"data"`
 }
+
+// BingX сменил формат /spot/v1/common/symbols (зонд 08.09.2026): список
+// вложен в data.symbols, а status — число (1 = активна, 0/10/25 — нет).
 type bingxSpotSymbolsResponse struct {
-	Code int `json:"code"`
-	Data []struct {
-		Symbol string `json:"symbol"`
-		Status string `json:"status"`
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Symbols []bingxSpotSymbol `json:"symbols"`
 	} `json:"data"`
+}
+
+type bingxSpotSymbol struct {
+	Symbol string `json:"symbol"`
+	Status int    `json:"status"`
 }
 type bingxSwapContractsResponse struct {
 	Code int `json:"code"`
@@ -469,9 +508,9 @@ func bingxCandleSymbols(ctx context.Context, spot bool) ([]string, error) {
 		if x.Code != 0 {
 			return nil, fmt.Errorf("bingx candle symbols API code %d", x.Code)
 		}
-		out := make([]string, 0, len(x.Data))
-		for _, v := range x.Data {
-			if v.Status == "1" || strings.EqualFold(v.Status, "trading") {
+		out := make([]string, 0, len(x.Data.Symbols))
+		for _, v := range x.Data.Symbols {
+			if v.Status == 1 {
 				out = append(out, v.Symbol)
 			}
 		}
@@ -487,6 +526,51 @@ func bingxCandleSymbols(ctx context.Context, spot bool) ([]string, error) {
 	out := make([]string, 0, len(x.Data))
 	for _, v := range x.Data {
 		if v.Status == 1 {
+			out = append(out, v.Symbol)
+		}
+	}
+	return out, nil
+}
+
+// bingxTickerSymbols возвращает активные USDT-пары для тикерных подписок:
+// спот — data.symbols (status==1, суффикс -USDT), фьючерсы — swap contracts.
+func bingxTickerSymbols(ctx context.Context, spot bool) ([]string, error) {
+	if !spot {
+		all, err := bingxCandleSymbols(ctx, false)
+		if err != nil {
+			return nil, fmt.Errorf("bingxTickerSymbols: %w", err)
+		}
+		out := make([]string, 0, len(all))
+		for _, s := range all {
+			if strings.HasSuffix(s, "-USDT") {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	}
+	url := "https://open-api.bingx.com/openApi/spot/v1/common/symbols"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("bingxTickerSymbols: %w", err)
+	}
+	r, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("bingxTickerSymbols: %w", err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode < 200 || r.StatusCode >= 300 {
+		return nil, fmt.Errorf("bingx ticker symbols HTTP %s", r.Status)
+	}
+	var x bingxSpotSymbolsResponse
+	if err := json.NewDecoder(r.Body).Decode(&x); err != nil {
+		return nil, fmt.Errorf("bingxTickerSymbols: %w", err)
+	}
+	if x.Code != 0 {
+		return nil, fmt.Errorf("bingx ticker symbols API code %d", x.Code)
+	}
+	out := make([]string, 0, len(x.Data.Symbols))
+	for _, v := range x.Data.Symbols {
+		if v.Status == 1 && strings.HasSuffix(v.Symbol, "-USDT") {
 			out = append(out, v.Symbol)
 		}
 	}
