@@ -37,6 +37,21 @@ cp .env.example .env
 docker compose up --build
 ```
 
+### Быстрый старт разработки (Linux, без Docker)
+
+`scripts/dev-setup.sh` идемпотентно разворачивает окружение с нуля: Go 1.26.4,
+зависимости, PostgreSQL с базой `screener_db` и схемой, `.env` из шаблона,
+затем выполняет проверочный гейт (build / vet / test) и собирает `./screener`.
+
+```bash
+./scripts/dev-setup.sh            # всё
+./scripts/dev-setup.sh --race     # тесты с детектором гонок
+./scripts/dev-setup.sh --no-db    # пропустить установку PostgreSQL
+```
+
+Крединалы БД переопределяются переменными `DB_USER` / `DB_PASSWORD` / `DB_NAME`.
+Подробная отчётность по проекту — в каталоге [docs/](docs/).
+
 ## Проверка
 
 ```bash
