@@ -59,6 +59,18 @@ services:
     depends_on:
       - app
 
+  # Алерты → вебхук приложения (app:9090/alerts) → Telegram админам.
+  # UI: http://localhost:9093.
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    depends_on:
+      - app
+
   # Дашборд crypto-screener автозагружается из observability/grafana/dashboards.
   # UI: http://localhost:3000 (admin / ${GRAFANA_ADMIN_PASSWORD:-admin}).
   grafana:

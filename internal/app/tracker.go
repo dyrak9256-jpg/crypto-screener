@@ -23,6 +23,20 @@ func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSigna
 	return &Tracker{activeSignals: make(map[string]*domain.ArbitrageSignal), config: cfg, dbChan: dbChan, router: router}
 }
 
+// ActiveSnapshot возвращает копии активных сигналов (для /signals).
+func (t *Tracker) ActiveSnapshot() []domain.ArbitrageSignal {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]domain.ArbitrageSignal, 0, len(t.activeSignals))
+	for _, s := range t.activeSignals {
+		out = append(out, *s.Snapshot())
+	}
+	return out
+}
+
 // ActiveCount возвращает количество активных сигналов (для метрик/статуса).
 func (t *Tracker) ActiveCount() int {
 	if t == nil {

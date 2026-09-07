@@ -60,6 +60,24 @@ type StatsRepository interface {
 	SignalStats24h(ctx context.Context) (SignalStats, error)
 }
 
+// SignalReader — опциональная способность: последние закрытые сигналы
+// для команды /signals (история для пользователей бота).
+type SignalReader interface {
+	RecentClosedSignals(ctx context.Context, limit int) ([]SignalSummary, error)
+}
+
+// SignalSummary — краткое представление закрытого сигнала для выдачи в боте.
+type SignalSummary struct {
+	Symbol       string
+	SpreadType   SpreadType
+	BuyExchange  string
+	SellExchange string
+	PeakSpread   decimal.Decimal
+	OpenedAt     time.Time
+	ClosedAt     time.Time
+	Duration     time.Duration
+}
+
 // SignalStats — агрегат по сигналам за последние 24 часа.
 type SignalStats struct {
 	Opened24h     int

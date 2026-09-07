@@ -293,3 +293,49 @@ func TestPostgresRepository_ReconcileActiveSignals(t *testing.T) {
 	assert.Nil(t, final)
 	assert.Greater(t, duration, int64(0))
 }
+
+func TestPostgresRepository_RecentClosedSignals(t *testing.T) {
+	repo, cleanup := setupTestPostgres(t)
+	if repo == nil {
+		return
+	}
+	defer cleanup()
+	ctx := context.Background()
+
+	// Один активный и два закрытых сигнала: /signals показывает только закрытые,
+	// свежие — первыми.
+	now := time.Now()
+	for i, spec := range []struct {
+		symbol    string
+		active    bool
+		closedAgo time.Duration
+	}{
+		{"BTCUSDT", false, 1 * time.Hour},
+		{"ETHUSDT", false, 5 * time.Minute},
+		{"SOLUSDT", true, 0},
+	} {
+		s := &domain.ArbitrageSignal{
+			Symbol: spec.symbol, SpreadType: domain.CrossExchange,
+			ExchangeA: "BITGET", ExchangeB: "OKX", BuyExchange: "BITGET", SellExchange: "OKX",
+			BuyMarket: domain.MarketTypeFutures, SellMarket: domain.MarketTypeFutures,
+			OpenedAt: now.Add(-2 * time.Hour), IsActive: spec.active,
+			InitialSpread: decimal.RequireFromString("0.011"), PeakSpread: decimal.RequireFromString("0.012"),
+			QuoteVolume: decimal.NewFromInt(100000),
+		}
+		if !spec.active {
+			s.ClosedAt = now.Add(-spec.closedAgo)
+			s.Duration = 30 * time.Minute
+		}
+		s.ID = uuid.New().String()
+		require.NoError(t, repo.SaveSignal(ctx, s), "сигнал %d", i)
+	}
+
+	rows, err := repo.RecentClosedSignals(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, rows, 2, "активный сигнал не попадает в выдачу")
+	require.Equal(t, "ETHUSDT", rows[0].Symbol, "самый свежий закрытый — первым")
+	require.Equal(t, "BTCUSDT", rows[1].Symbol)
+	require.True(t, rows[0].PeakSpread.Equal(decimal.RequireFromString("0.012")))
+	require.Equal(t, 30*time.Minute, rows[0].Duration)
+	require.Equal(t, "BITGET", rows[0].BuyExchange)
+}

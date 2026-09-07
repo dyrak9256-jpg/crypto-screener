@@ -70,6 +70,18 @@ docker compose up --build
 
 Логи — структурированные `slog`: формат `LOG_FORMAT=text|json`, уровень `LOG_LEVEL=debug|info|warn|error`.
 
+### Гео-блоки бирж и как проект их обходит
+
+| Биржа | Проблема | Решение |
+|---|---|---|
+| **Binance** | `api.binance.com`/`stream/fstream` — 451 в ряде регионов | Спот-данные идут через официальные зеркала `data-api`/`data-stream.binance.vision` (гео-независимы); фьючерсы — `BINANCE_SPOT_ONLY=1` или прокси-хосты через env `BINANCE_*` |
+| **Bybit** | REST гео-блок (CloudFront 403), WS работает | `internal/adapters/bybit/seed.go` (топ-символы по ликвидности) + дисковый кэш `SYMBOLS_CACHE_DIR` + шардирование подписок по 10 символов; лимит числа символов — `BYBIT_SYMBOL_LIMIT` (по умолчанию 100) |
+| **MEXC** | WS-блок дата-центровых IP (funding REST работает) | зависит от IP прода |
+
+Команды пользователя: `/start /stop /setcross /setvol /settimeframe /setfundingtime /signals` —
+активные и последние закрытые сигналы. Алерты мониторинга (Alertmanager) доставляются
+вебхуком в приложение и пересылаются администраторам в Telegram.
+
 ### Grafana + Prometheus (панель мониторинга)
 
 В `docker-compose.yml` есть сервисы `prometheus` (порт **9091**) и `grafana` (порт **3000**, вход `admin`, пароль `GRAFANA_ADMIN_PASSWORD`, по умолчанию `admin`; анонимный просмотр разрешён). Конфигурация — в `observability/`:
@@ -84,7 +96,7 @@ observability/
                                           #   Telegram, очереди, алерты, heap/goroutines
 ```
 
-Запуск: `docker compose up -d prometheus grafana` → дашборд «Crypto Screener — обзор» на http://localhost:3000 (автообновление 30с, история с Prometheus TSDB, retention 15 дней). Алерты видны в Prometheus `/alerts` и на панели дашборда; доставка в Telegram — через Alertmanager (P1, см. `docs/08-improvements-next.md`).
+Запуск: `docker compose up -d prometheus grafana alertmanager` → дашборд «Crypto Screener — обзор» на http://localhost:3000 (автообновление 30с, история с Prometheus TSDB, retention 15 дней). Алерты (биржа молчит >5 мин, funding >120с, потеря Telegram-уведомлений, ошибки БД, скринер недоступен) доставляются цепочкой Prometheus → **Alertmanager (:9093)** → вебхук `POST /alerts` приложения → Telegram администраторам. UI алертов: http://localhost:9093.
 
 ## Команды Telegram
 

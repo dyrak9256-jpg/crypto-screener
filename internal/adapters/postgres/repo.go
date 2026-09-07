@@ -123,6 +123,51 @@ func (r *Repository) SignalStats24h(ctx context.Context) (domain.SignalStats, er
 	return stats, nil
 }
 
+// RecentClosedSignals возвращает последние закрытые сигналы (для /signals).
+func (r *Repository) RecentClosedSignals(ctx context.Context, limit int) ([]domain.SignalSummary, error) {
+	if r == nil || r.pool == nil {
+		return nil, fmt.Errorf("postgres repository is nil")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 50 {
+		limit = 50
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT symbol, spread_type, buy_exchange, sell_exchange,
+		       peak_spread, opened_at, closed_at, COALESCE(duration_ms, 0)
+		FROM signals
+		WHERE is_active = FALSE AND closed_at IS NOT NULL
+		ORDER BY closed_at DESC
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("recent closed signals: %w", err)
+	}
+	defer rows.Close()
+	out := make([]domain.SignalSummary, 0, limit)
+	for rows.Next() {
+		var (
+			sum        domain.SignalSummary
+			peak       string
+			durationMs int64
+		)
+		if err := rows.Scan(&sum.Symbol, &sum.SpreadType, &sum.BuyExchange, &sum.SellExchange,
+			&peak, &sum.OpenedAt, &sum.ClosedAt, &durationMs); err != nil {
+			return nil, fmt.Errorf("recent closed signals scan: %w", err)
+		}
+		if d, err := decimal.NewFromString(peak); err == nil {
+			sum.PeakSpread = d
+		}
+		sum.Duration = time.Duration(durationMs) * time.Millisecond
+		out = append(out, sum)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("recent closed signals: %w", err)
+	}
+	return out, nil
+}
+
 // ReconcileActiveSignals closes signals that were left active by a previous
 // process instance. Active lifecycle state is in-memory, so after a crash there
 // is no valid in-memory route that can keep those rows active.

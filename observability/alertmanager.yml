@@ -1,0 +1,16 @@
+# Alertmanager для crypto-screener: алерты Prometheus доставляются вебхуком
+# в приложение (POST app:9090/alerts), которое пересылает их администраторам
+# в Telegram (ADMIN_CHAT_IDS) — отдельный Telegram-транспорт не нужен.
+route:
+  group_by: ["alertname"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: screener-webhook
+
+receivers:
+  - name: screener-webhook
+    webhook_configs:
+      - url: http://app:9090/alerts
+        send_resolved: true
+
