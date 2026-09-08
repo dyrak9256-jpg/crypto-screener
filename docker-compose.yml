@@ -38,13 +38,13 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
       # Метрики/статус: /metrics, /healthz, /api/status, /debug/pprof/
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     stop_grace_period: 90s
 
   # Наблюдение: скрейпит app:9090/metrics, правила алертов — observability/alerts.yml.
   # UI: http://localhost:9091 (алерты — /alerts).
   prometheus:
-    image: prom/prometheus:v3.4.1
+    image: prom/prometheus:v3.13.3
     restart: unless-stopped
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -55,7 +55,7 @@ services:
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
       - promdata:/prometheus
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     depends_on:
       - app
 
@@ -67,7 +67,7 @@ services:
     volumes:
       - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
     ports:
-      - "9093:9093"
+      - "127.0.0.1:9093:9093"
     depends_on:
       - app
 
@@ -88,7 +88,7 @@ services:
       - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
       - grafana_data:/var/lib/grafana
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - prometheus
 

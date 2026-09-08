@@ -13,6 +13,9 @@ type User struct {
 	MinVolume         decimal.Decimal
 	Timeframe         Timeframe
 	MinFundingMinutes int
+	// UpdateStep is the per-user Telegram UPDATE threshold as a fraction (0.003 = 0.3 percentage points).
+	// Zero disables UPDATE notifications.
+	UpdateStep decimal.Decimal
 	// BotID identifies which Telegram bot instance serves this user when
 	// several bot tokens share the delivery load (TELEGRAM_TOKENS).
 	BotID int64
@@ -66,8 +69,12 @@ func (um *UserManager) Range(fn func(User) bool) {
 		return
 	}
 	um.mu.RLock()
-	defer um.mu.RUnlock()
+	snapshot := make([]User, 0, len(um.users))
 	for _, u := range um.users {
+		snapshot = append(snapshot, u)
+	}
+	um.mu.RUnlock()
+	for _, u := range snapshot {
 		if !fn(u) {
 			return
 		}

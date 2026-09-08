@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -164,9 +165,9 @@ func main() {
 	case err := <-appErr:
 		if err != nil {
 			slog.Error("app failed", "error", err)
-			cancel()
-			return
 		}
+		cancel()
+		<-tgDone
 	case <-tgDone:
 		// Все боты остановились — без доставки уведомлений скринер не имеет
 		// смысла, поэтому корректно завершаем всё приложение.
@@ -241,7 +242,7 @@ func checkExchangeAvailability() map[string]string {
 		switch {
 		case r.status == "ok":
 			slog.Info("exchange reachable", "exchange", r.name)
-		case len(r.status) > 4 && r.status[:4] == "HTTP" && (r.status[len(r.status)-13:] == "(geo-blocked)"):
+		case strings.HasPrefix(r.status, "HTTP") && strings.HasSuffix(r.status, "(geo-blocked)"):
 			slog.Error("exchange GEO-BLOCKED from this host — connector will not receive data; deploy in an allowed region or use a proxy",
 				"exchange", r.name, "status", r.status)
 		default:

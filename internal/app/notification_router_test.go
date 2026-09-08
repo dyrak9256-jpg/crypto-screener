@@ -82,3 +82,27 @@ func TestNotificationRouter_TargetsAreComputedWithoutTelegramTransport(t *testin
 	}
 	require.Equal(t, []int64{42}, r.ProcessSignal(s, true))
 }
+
+func TestNotificationRouter_UpdateThresholdUsesPercentagePoints(t *testing.T) {
+	um := domain.NewUserManager()
+	um.SetUser(&domain.User{ChatID: 9, MinSpread: decimal.RequireFromString("0.02"), MinVolume: decimal.Zero, Timeframe: domain.TF_24h, UpdateStep: decimal.RequireFromString("0.003")})
+	tg := mocks.NewMockTelegramSender(gomock.NewController(t))
+	updates := make(chan string, 2)
+	tg.EXPECT().Broadcast(gomock.Any(), []int64{9}).Times(2).Do(func(text string, _ []int64) { updates <- text })
+	r := NewNotificationRouter(um, tg)
+	defer r.Close()
+	now := time.Now()
+	s := &domain.ArbitrageSignal{ID: "u1", Symbol: "BTCUSDT", SpreadType: domain.CrossExchange, BuyExchange: "A", SellExchange: "B", PeakSpread: decimal.RequireFromString("0.02"), InitialSpread: decimal.RequireFromString("0.02"), QuoteVolume: decimal.NewFromInt(1000), OpenedAt: now, IsActive: true}
+	r.ProcessSignal(s, true)
+	s.PeakSpread = decimal.RequireFromString("0.023")
+	r.ProcessSignalUpdate(s)
+	s.PeakSpread = decimal.RequireFromString("0.026")
+	r.ProcessSignalUpdate(s)
+	for i := 0; i < 2; i++ {
+		select {
+		case <-updates:
+		case <-time.After(2 * time.Second):
+			t.Fatal("update not delivered")
+		}
+	}
+}
