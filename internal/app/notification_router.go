@@ -1,8 +1,10 @@
 package app
 
 import (
+	"context"
 	"crypto-screener/internal/domain"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -27,21 +29,25 @@ type updateKey struct {
 }
 
 type NotificationRouter struct {
-	userMgr       *domain.UserManager
-	telegram      domain.TelegramSender
-	volume        *VolumeEngine
-	config        *domain.ScreenerConfig
-	wake          chan struct{}
-	pending       map[string]notificationJob
-	stop          chan struct{}
-	wg            sync.WaitGroup
-	mu            sync.RWMutex
-	closed        bool
-	clock         Clock
-	telegramReady chan struct{}
-	revalidator   func(*domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool)
-	updateMu      sync.Mutex
-	lastUpdate    map[updateKey]decimal.Decimal
+	userMgr        *domain.UserManager
+	telegram       domain.TelegramSender
+	volume         *VolumeEngine
+	config         *domain.ScreenerConfig
+	wake           chan struct{}
+	pending        map[string]notificationJob
+	stop           chan struct{}
+	wg             sync.WaitGroup
+	mu             sync.RWMutex
+	closed         bool
+	clock          Clock
+	telegramReady  chan struct{}
+	revalidator    func(*domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool)
+	updateMu       sync.Mutex
+	lastUpdate     map[updateKey]decimal.Decimal
+	lifecycleMu    sync.Mutex
+	reliableCtx    context.Context
+	reliableCancel context.CancelFunc
+	invalidated    map[string]struct{}
 }
 
 func NewNotificationRouter(userMgr *domain.UserManager, tg domain.TelegramSender, extras ...any) *NotificationRouter {
@@ -55,17 +61,21 @@ func NewNotificationRouter(userMgr *domain.UserManager, tg domain.TelegramSender
 			cfg = x
 		}
 	}
+	reliableCtx, reliableCancel := context.WithCancel(context.Background())
 	nr := &NotificationRouter{
-		userMgr:       userMgr,
-		telegram:      tg,
-		volume:        v,
-		config:        cfg,
-		wake:          make(chan struct{}, 1),
-		pending:       make(map[string]notificationJob),
-		stop:          make(chan struct{}),
-		clock:         realClock{},
-		telegramReady: make(chan struct{}),
-		lastUpdate:    make(map[updateKey]decimal.Decimal),
+		userMgr:        userMgr,
+		telegram:       tg,
+		volume:         v,
+		config:         cfg,
+		wake:           make(chan struct{}, 1),
+		pending:        make(map[string]notificationJob),
+		stop:           make(chan struct{}),
+		clock:          realClock{},
+		telegramReady:  make(chan struct{}),
+		lastUpdate:     make(map[updateKey]decimal.Decimal),
+		invalidated:    make(map[string]struct{}),
+		reliableCtx:    reliableCtx,
+		reliableCancel: reliableCancel,
 	}
 	const workerCount = 4
 	nr.wg.Add(workerCount)
@@ -154,6 +164,15 @@ func (nr *NotificationRouter) enqueue(job notificationJob) bool {
 }
 
 func (nr *NotificationRouter) sendJob(job notificationJob) {
+	isClose := strings.HasSuffix(job.key, ":close")
+	if job.signal != nil && !isClose {
+		nr.lifecycleMu.Lock()
+		_, invalid := nr.invalidated[job.signal.ID]
+		nr.lifecycleMu.Unlock()
+		if invalid {
+			return
+		}
+	}
 	if job.revalidate && job.signal != nil {
 		nr.mu.RLock()
 		revalidator := nr.revalidator
@@ -174,10 +193,7 @@ func (nr *NotificationRouter) sendJob(job notificationJob) {
 			if len(job.chatIDs) == 0 {
 				return
 			}
-			// Revalidation is performed immediately before transport, so an OPEN or
-			// UPDATE generated during a Telegram outage is discarded if the exact
-			// route no longer passes the global hard floor or current user filters.
-			job.text = renderSignalNotification(current, !strings.HasSuffix(job.key, ":close"), strings.HasSuffix(job.key, ":update"))
+			job.text = renderSignalNotification(current, !isClose, strings.HasSuffix(job.key, ":update"))
 		}
 	}
 	for {
@@ -186,7 +202,29 @@ func (nr *NotificationRouter) sendJob(job notificationJob) {
 		closed := nr.closed
 		nr.mu.RUnlock()
 		if tg != nil {
-			tg.Broadcast(job.text, job.chatIDs)
+			// Serialize the final lifecycle check with CLOSE invalidation and the
+			// actual transport call. Thus a queued UPDATE can never be sent after
+			// Tracker has committed the signal to CLOSED.
+			nr.lifecycleMu.Lock()
+			if job.signal != nil && !isClose {
+				if _, invalid := nr.invalidated[job.signal.ID]; invalid {
+					nr.lifecycleMu.Unlock()
+					return
+				}
+			}
+			if reliable, ok := tg.(domain.ReliableTelegramSender); ok && job.signal != nil {
+				nr.mu.RLock()
+				reliableCtx := nr.reliableCtx
+				nr.mu.RUnlock()
+				err := reliable.BroadcastReliable(reliableCtx, job.text, job.chatIDs)
+				nr.lifecycleMu.Unlock()
+				if err != nil {
+					slog.Warn("reliable telegram delivery failed", "signal_id", job.signal.ID, "error", err)
+				}
+			} else {
+				tg.Broadcast(job.text, job.chatIDs)
+				nr.lifecycleMu.Unlock()
+			}
 			return
 		}
 		if closed {
@@ -235,6 +273,9 @@ func (nr *NotificationRouter) Close() {
 		return
 	}
 	nr.closed = true
+	if nr.reliableCancel != nil {
+		nr.reliableCancel()
+	}
 	close(nr.stop)
 	nr.mu.Unlock()
 	nr.wg.Wait()
@@ -372,6 +413,15 @@ func (nr *NotificationRouter) ProcessSignalUpdate(signal *domain.ArbitrageSignal
 	text := fmt.Sprintf("📈 SIGNAL UPDATE\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), now.Format(time.RFC3339Nano))
 	nr.enqueue(notificationJob{key: signal.ID + ":update", text: text, chatIDs: append([]int64(nil), targets...), signal: signal.Snapshot(), revalidate: true})
 	return targets
+}
+
+func (nr *NotificationRouter) invalidateSignal(signalID string) {
+	if nr == nil || signalID == "" {
+		return
+	}
+	nr.lifecycleMu.Lock()
+	nr.invalidated[signalID] = struct{}{}
+	nr.lifecycleMu.Unlock()
 }
 
 func (nr *NotificationRouter) dropPending(key string) {

@@ -178,6 +178,7 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 				t.mu.Unlock()
 			}
 		} else {
+			t.router.invalidateSignal(notify.ID)
 			t.router.dropPending(notify.ID + ":update")
 			t.router.ProcessSignal(notify, false)
 			t.router.ClearSignalUpdates(notify.ID)

@@ -36,6 +36,15 @@ type TelegramSender interface {
 	Close()
 }
 
+// ReliableTelegramSender is an optional stronger transport used for critical
+// signal notifications. It returns only after Telegram has accepted every
+// message or a permanent transport error is reached. Transient failures are
+// retried by the transport.
+type ReliableTelegramSender interface {
+	TelegramSender
+	BroadcastReliable(ctx context.Context, text string, chatIDs []int64) error
+}
+
 type SignalRepository interface {
 	SaveSignal(ctx context.Context, signal *ArbitrageSignal) error
 }

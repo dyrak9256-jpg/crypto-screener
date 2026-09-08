@@ -1,6 +1,7 @@
 package app
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -87,8 +88,8 @@ func TestNotificationRouter_UpdateThresholdUsesPercentagePoints(t *testing.T) {
 	um := domain.NewUserManager()
 	um.SetUser(&domain.User{ChatID: 9, MinSpread: decimal.RequireFromString("0.02"), MinVolume: decimal.Zero, Timeframe: domain.TF_24h, UpdateStep: decimal.RequireFromString("0.003")})
 	tg := mocks.NewMockTelegramSender(gomock.NewController(t))
-	updates := make(chan string, 2)
-	tg.EXPECT().Broadcast(gomock.Any(), []int64{9}).Times(2).Do(func(text string, _ []int64) { updates <- text })
+	broadcasts := make(chan string, 2)
+	tg.EXPECT().Broadcast(gomock.Any(), []int64{9}).Times(2).Do(func(text string, _ []int64) { broadcasts <- text })
 	r := NewNotificationRouter(um, tg)
 	defer r.Close()
 	now := time.Now()
@@ -98,11 +99,49 @@ func TestNotificationRouter_UpdateThresholdUsesPercentagePoints(t *testing.T) {
 	r.ProcessSignalUpdate(s)
 	s.PeakSpread = decimal.RequireFromString("0.026")
 	r.ProcessSignalUpdate(s)
+	got := make([]string, 0, 2)
 	for i := 0; i < 2; i++ {
 		select {
-		case <-updates:
+		case text := <-broadcasts:
+			got = append(got, text)
 		case <-time.After(2 * time.Second):
-			t.Fatal("update not delivered")
+			t.Fatalf("broadcast %d was not delivered", i+1)
 		}
 	}
+	updates := 0
+	for _, text := range got {
+		if strings.HasPrefix(text, "📈 SIGNAL UPDATE") {
+			updates++
+		}
+	}
+	require.Equal(t, 1, updates)
+}
+
+func TestNotificationRouter_DropsUpdateInvalidatedBeforeTransport(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	um := domain.NewUserManager()
+	um.SetUser(&domain.User{ChatID: 55, MinSpread: decimal.RequireFromString("0.01"), MinVolume: decimal.Zero, Timeframe: domain.TF_24h, UpdateStep: decimal.RequireFromString("0.001")})
+	tg := mocks.NewMockTelegramSender(ctrl)
+	tg.EXPECT().Broadcast(gomock.Any(), gomock.Any()).Times(0)
+	r := NewNotificationRouter(um, tg)
+	defer r.Close()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	r.SetRevalidator(func(s *domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool) {
+		close(entered)
+		<-release
+		return s.Snapshot(), true
+	})
+	now := time.Now()
+	s := &domain.ArbitrageSignal{ID: "race-1", Symbol: "BTCUSDT", SpreadType: domain.CrossExchange, BuyExchange: "A", SellExchange: "B", PeakSpread: decimal.RequireFromString("0.011"), InitialSpread: decimal.RequireFromString("0.010"), QuoteVolume: decimal.NewFromInt(1000), OpenedAt: now, IsActive: true}
+	r.ProcessSignalUpdate(s)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("notification worker did not enter revalidation")
+	}
+	r.invalidateSignal(s.ID)
+	close(release)
+	time.Sleep(50 * time.Millisecond)
 }

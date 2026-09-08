@@ -30,18 +30,25 @@ type commandRequest struct {
 	args              []string
 }
 
+type reliableSendRequest struct {
+	ctx    context.Context
+	msg    tgbotapi.Chattable
+	result chan error
+}
+
 type Bot struct {
 	// id идентифицирует бота внутри пула (индекс токена в TELEGRAM_TOKENS).
-	id         int64
-	api        *tgbotapi.BotAPI
-	sendChan   chan tgbotapi.Chattable
-	cmdHandler domain.CommandHandler
-	commandWg  sync.WaitGroup
-	sendWg     sync.WaitGroup
-	closeOnce  sync.Once
-	closed     atomic.Bool
-	commands   chan commandRequest
-	sendStop   chan struct{}
+	id           int64
+	api          *tgbotapi.BotAPI
+	sendChan     chan tgbotapi.Chattable
+	reliableChan chan reliableSendRequest
+	cmdHandler   domain.CommandHandler
+	commandWg    sync.WaitGroup
+	sendWg       sync.WaitGroup
+	closeOnce    sync.Once
+	closed       atomic.Bool
+	commands     chan commandRequest
+	sendStop     chan struct{}
 }
 
 func NewBot(id int64, token string, handler domain.CommandHandler) (*Bot, error) {
@@ -52,7 +59,7 @@ func NewBot(id int64, token string, handler domain.CommandHandler) (*Bot, error)
 	if err != nil {
 		return nil, fmt.Errorf("init telegram bot: %w", err)
 	}
-	b := &Bot{id: id, api: api, cmdHandler: handler, sendChan: make(chan tgbotapi.Chattable, sendChanBuffer), commands: make(chan commandRequest, commandQueueBuffer), sendStop: make(chan struct{})}
+	b := &Bot{id: id, api: api, cmdHandler: handler, sendChan: make(chan tgbotapi.Chattable, sendChanBuffer), reliableChan: make(chan reliableSendRequest, sendChanBuffer), commands: make(chan commandRequest, commandQueueBuffer), sendStop: make(chan struct{})}
 	b.sendWg.Add(1)
 	go b.sendWorker()
 	for i := 0; i < commandWorkers; i++ {
@@ -86,48 +93,145 @@ func (b *Bot) sendWorker() {
 			return
 		default:
 		}
+
+		// Critical/reliable notifications have priority over the best-effort queue.
 		select {
-		case <-b.sendStop:
-			return
-		case msg, ok := <-b.sendChan:
-			if !ok {
-				return
-			}
+		case req := <-b.reliableChan:
+			b.sendReliable(req, ticker)
+		default:
 			select {
 			case <-b.sendStop:
 				return
-			case <-ticker.C:
-			}
-			if _, err := b.api.Send(msg); err != nil {
-				if retry, ok := telegramRetryAfter(err); ok {
-					timer := time.NewTimer(retry)
-					select {
-					case <-b.sendStop:
-						if !timer.Stop() {
-							select {
-							case <-timer.C:
-							default:
-							}
-						}
-						return
-					case <-timer.C:
-					}
-					if _, retryErr := b.api.Send(msg); retryErr != nil {
-						observability.TelegramDropped()
-						slog.Warn("telegram retry send failed", "bot_id", b.id, "error", retryErr)
-					} else {
-						observability.TelegramSent()
-					}
-				} else {
-					observability.TelegramDropped()
-					slog.Warn("telegram send failed", "bot_id", b.id, "error", err)
-				}
-			} else {
-				observability.TelegramSent()
+			case req := <-b.reliableChan:
+				b.sendReliable(req, ticker)
+			case msg := <-b.sendChan:
+				b.sendBestEffort(msg, ticker)
 			}
 		}
 	}
 }
+
+func (b *Bot) waitSendInterval(ticker *time.Ticker) bool {
+	select {
+	case <-b.sendStop:
+		return false
+	case <-ticker.C:
+		return true
+	}
+}
+
+func (b *Bot) sendBestEffort(msg tgbotapi.Chattable, ticker *time.Ticker) {
+	if !b.waitSendInterval(ticker) {
+		return
+	}
+	if _, err := b.api.Send(msg); err != nil {
+		if retry, ok := telegramRetryAfter(err); ok {
+			timer := time.NewTimer(retry)
+			select {
+			case <-b.sendStop:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+			}
+			if _, retryErr := b.api.Send(msg); retryErr != nil {
+				observability.TelegramDropped()
+				slog.Warn("telegram retry send failed", "bot_id", b.id, "error", retryErr)
+			} else {
+				observability.TelegramSent()
+			}
+		} else {
+			observability.TelegramDropped()
+			slog.Warn("telegram send failed", "bot_id", b.id, "error", err)
+		}
+	} else {
+		observability.TelegramSent()
+	}
+}
+
+func (b *Bot) sendReliable(req reliableSendRequest, ticker *time.Ticker) {
+	if req.ctx == nil {
+		req.ctx = context.Background()
+	}
+	if req.result == nil {
+		return
+	}
+	if !b.waitSendIntervalContext(req.ctx, ticker) {
+		req.result <- errors.New("telegram reliable delivery cancelled")
+		return
+	}
+
+	for {
+		select {
+		case <-req.ctx.Done():
+			req.result <- req.ctx.Err()
+			return
+		default:
+		}
+		_, err := b.api.Send(req.msg)
+		if err == nil {
+			observability.TelegramSent()
+			req.result <- nil
+			return
+		}
+		if retry, ok := telegramRetryAfter(err); ok {
+			if !b.waitRetryContext(req.ctx, retry) {
+				req.result <- req.ctx.Err()
+				return
+			}
+			continue
+		}
+		// Retry network/server failures. Telegram API 4xx errors are permanent
+		// for this message and must be surfaced to the router rather than hidden.
+		if shouldRetryTelegram(err) {
+			if !b.waitRetryContext(req.ctx, retryAfterDefault) {
+				req.result <- req.ctx.Err()
+				return
+			}
+			continue
+		}
+		observability.TelegramDropped()
+		req.result <- err
+		return
+	}
+}
+
+func (b *Bot) waitSendIntervalContext(ctx context.Context, ticker *time.Ticker) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-b.sendStop:
+		return false
+	case <-ticker.C:
+		return true
+	}
+}
+
+func (b *Bot) waitRetryContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-b.sendStop:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func shouldRetryTelegram(err error) bool {
+	var tgErr *tgbotapi.Error
+	if errorsAs(err, &tgErr) {
+		return tgErr.Code >= 500 || tgErr.Code == 0
+	}
+	return true
+}
+
 func telegramRetryAfter(err error) (time.Duration, bool) {
 	var tgErr *tgbotapi.Error
 	if !errorsAs(err, &tgErr) || tgErr.Code != 429 {
@@ -170,6 +274,42 @@ func (b *Bot) Broadcast(text string, chatIDs []int64) {
 			slog.Warn("telegram send queue full, broadcast message dropped", "bot_id", b.id, "chat_id", id)
 		}
 	}
+}
+
+func (b *Bot) BroadcastReliable(ctx context.Context, text string, chatIDs []int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if b.reliableChan == nil {
+		return errors.New("telegram reliable queue is not initialized")
+	}
+	var firstErr error
+	for _, id := range chatIDs {
+		msg := tgbotapi.NewMessage(id, text)
+		if b.closed.Load() {
+			return errors.New("telegram bot is closed")
+		}
+		req := reliableSendRequest{ctx: ctx, msg: msg, result: make(chan error, 1)}
+		select {
+		case b.reliableChan <- req:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-b.sendStop:
+			return errors.New("telegram bot is stopping")
+		}
+		var err error
+		select {
+		case err = <-req.result:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("telegram delivery to chat %d: %w", id, err)
+			}
+		}
+	}
+	return firstErr
 }
 
 func (b *Bot) Close() {

@@ -162,10 +162,3 @@ func (w *BufferedPersistenceWorker) flush(parent context.Context, limit int) {
 		w.buffer.Ack(batch)
 	}
 }
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

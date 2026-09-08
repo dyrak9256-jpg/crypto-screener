@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 
@@ -75,6 +76,38 @@ func (p *BotPool) Broadcast(text string, chatIDs []int64) {
 	}
 }
 
+// BroadcastReliable delivers every critical notification and waits for the
+// Telegram API acknowledgement. Transient failures are retried by the bot
+// transport; permanent failures are returned to the caller.
+func (p *BotPool) BroadcastReliable(ctx context.Context, text string, chatIDs []int64) error {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.bots) == 0 {
+		return fmt.Errorf("telegram bot pool is empty")
+	}
+	byBot := make(map[*Bot][]int64)
+	for _, id := range chatIDs {
+		b := p.bots[0]
+		if p.route != nil {
+			botID := p.route(id)
+			for _, cand := range p.bots {
+				if cand.id == botID {
+					b = cand
+					break
+				}
+			}
+		}
+		byBot[b] = append(byBot[b], id)
+	}
+	var firstErr error
+	for b, ids := range byBot {
+		if err := b.BroadcastReliable(ctx, text, ids); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // StartPolling запускает getUpdates-циклы всех ботов и ждёт их завершения.
 // Ошибка любого бота логируется, но не останавливает остальных.
 func (p *BotPool) StartPolling(ctx context.Context) error {
@@ -113,3 +146,4 @@ func (p *BotPool) Len() int {
 }
 
 var _ domain.TelegramSender = (*BotPool)(nil)
+var _ domain.ReliableTelegramSender = (*BotPool)(nil)

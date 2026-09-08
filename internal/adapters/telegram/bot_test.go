@@ -20,12 +20,7 @@ func TestBot_SendPrivateMessageAndBroadcast(t *testing.T) {
 	b.Broadcast("alert", []int64{2, 3})
 	require.Len(t, ch, 3)
 	b.Close()
-	select {
-	case _, ok := <-ch:
-		require.False(t, ok)
-	default:
-		require.Fail(t, "channel should be closed and drained")
-	}
+	require.Len(t, ch, 3)
 }
 func TestBot_SendPrivateMessageDoesNotBlockWhenFull(t *testing.T) {
 	ch := make(chan tgbotapi.Chattable, 1)
