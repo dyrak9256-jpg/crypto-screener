@@ -82,12 +82,26 @@ func (a *Adapter) ConnectFunding(ctx context.Context, sink domain.FundingSink) e
 	if sink == nil {
 		return fmt.Errorf("MEXC funding sink is nil")
 	}
-	symbols, err := mexcCandleSymbols(ctx, false)
-	if err != nil {
-		return fmt.Errorf("ConnectFunding: %w", err)
-	}
-	if len(symbols) == 0 {
-		return fmt.Errorf("MEXC returned no futures symbols for funding")
+	// Список фьючерсных символов нужен до старта поллинга. Раньше единичный
+	// сбой REST здесь завершал funding-поток навсегда; теперь ретраим.
+	backoff := retry.New(reconnectDelay, 30*time.Second)
+	var symbols []string
+	for {
+		loaded, err := mexcCandleSymbols(ctx, false)
+		if err == nil && len(loaded) > 0 {
+			symbols = loaded
+			break
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err == nil {
+			err = fmt.Errorf("MEXC returned no futures symbols")
+		}
+		log.Printf("⚠️ MEXC funding symbols: %v — retrying", err)
+		if !backoff.Wait(ctx.Done()) {
+			return nil
+		}
 	}
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
@@ -155,8 +169,23 @@ func (a *Adapter) ConnectSpot(ctx context.Context, out chan<- domain.MarketTick)
 }
 
 func (a *Adapter) ConnectFutures(ctx context.Context, out chan<- domain.MarketTick) error {
-	if err := a.ensureContractSizes(ctx); err != nil {
-		return fmt.Errorf("load MEXC futures contract sizes: %w", err)
+	// Раньше временный сбой REST при старте навсегда убивал фьючерсный поток
+	// MEXC (connector goroutine завершался, менеджер его не перезапускал).
+	// Теперь загрузка размеров контрактов ретраится с backoff до успеха или
+	// отмены контекста — как это делают остальные адаптеры.
+	backoff := retry.New(reconnectDelay, 30*time.Second)
+	for {
+		if err := a.ensureContractSizes(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			log.Printf("⚠️ MEXC futures contract sizes: %v — retrying", err)
+			if !backoff.Wait(ctx.Done()) {
+				return nil
+			}
+			continue
+		}
+		break
 	}
 	a.listenFutures(ctx, out)
 	return nil

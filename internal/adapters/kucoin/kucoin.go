@@ -551,7 +551,10 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, s
 		return fmt.Errorf("start websocket heartbeat: %w", err)
 	}
 	go closeOnCtx(connCtx, conn)
-	go kucoinKeepAlive(connCtx, conn, ping)
+	// Подписки отправляются ДО старта keepalive: gorilla/websocket запрещает
+	// конкурентные WriteJSON из нескольких горутин (kucoinKeepAlive шлёт
+	// app-level ping). Раньше keepalive стартовал первым и мог перемешать
+	// свой ping с subscribe-фреймом — повреждение фрейма и обрыв соединения.
 	for _, sym := range symbols {
 		topic := "/market/candles:" + sym + "_1min"
 		if market == domain.MarketTypeFutures {
@@ -561,6 +564,7 @@ func (a *Adapter) readCandleShard(ctx context.Context, sink domain.CandleSink, s
 			return fmt.Errorf("readCandleShard: %w", err)
 		}
 	}
+	go kucoinKeepAlive(connCtx, conn, ping)
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {

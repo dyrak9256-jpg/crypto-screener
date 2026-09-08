@@ -14,6 +14,11 @@ import (
 const (
 	numShards       = 1024
 	defaultPriceTTL = 5 * time.Second
+	// staleActiveRouteTTL — бюджет жизни active-маршрута без единого
+	// наблюдения. Close-логика ProcessTick привязана к входящим тикам
+	// символа: если тики прекратились совсем (rmex/делистинг/гео-блок),
+	// маршрут иначе остаётся в памяти и в БД (is_active=TRUE) навсегда.
+	staleActiveRouteTTL = 10 * time.Minute
 )
 
 type PriceState struct {
@@ -443,6 +448,7 @@ func minDecimal(a, b decimal.Decimal) decimal.Decimal {
 func (sa *ShardedAggregator) Janitor() {
 	now := time.Now()
 	cut := now.Add(-sa.priceTTL * 12)
+	var staleEvents []domain.SpreadEvent
 	for _, shard := range sa.shards {
 		shard.mu.Lock()
 		for symbol, byEx := range shard.prices {
@@ -460,7 +466,33 @@ func (sa *ShardedAggregator) Janitor() {
 				delete(shard.prices, symbol)
 			}
 		}
+		// Active-маршрут, по которому давно не было наблюдений, закрываем:
+		// без этого делистинг/отключение коннектора оставляли бы маршрут
+		// активным в памяти и в БД до перезапуска процесса.
+		for key, state := range shard.active {
+			if state == nil {
+				delete(shard.active, key)
+				continue
+			}
+			lastSeen := state.last.Timestamp
+			if lastSeen.IsZero() {
+				lastSeen = state.openedAt
+			}
+			if lastSeen.IsZero() || now.Sub(lastSeen) > staleActiveRouteTTL {
+				ev := state.last
+				ev.Spread = decimal.Zero
+				ev.Timestamp = now
+				ev.Lifecycle = domain.SignalClosed
+				staleEvents = append(staleEvents, ev)
+				delete(shard.active, key)
+			}
+		}
 		shard.mu.Unlock()
+	}
+	// Отправка — строго вне шардового лока (как в ProcessTick): sendEvent
+	// блокируется на backpressure трекера.
+	for _, event := range staleEvents {
+		sa.sendEvent(event)
 	}
 }
 
