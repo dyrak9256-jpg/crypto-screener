@@ -23,10 +23,17 @@ type notificationJob struct {
 // updateState prevents duplicate UPDATEs when several peak observations cross
 // the same user threshold concurrently. It is intentionally in-memory: the
 // notification ledger is runtime state, not analytics data.
+// UPDATE delivery is additionally debounced so a burst of threshold crossings
+// is coalesced into the latest snapshot before it reaches the transport.
 type updateKey struct {
 	signalID string
 	chatID   int64
 }
+
+const (
+	workerCount    = 4
+	updateDebounce = 25 * time.Millisecond
+)
 
 type NotificationRouter struct {
 	userMgr        *domain.UserManager
@@ -44,7 +51,11 @@ type NotificationRouter struct {
 	revalidator    func(*domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool)
 	updateMu       sync.Mutex
 	lastUpdate     map[updateKey]decimal.Decimal
+	updateTimers   map[string]*time.Timer
+	updateJobs     map[string]notificationJob
 	lifecycleMu    sync.Mutex
+	signalCancel   map[string]context.CancelFunc
+	signalCtx      map[string]context.Context
 	reliableCtx    context.Context
 	reliableCancel context.CancelFunc
 	invalidated    map[string]struct{}
@@ -73,11 +84,14 @@ func NewNotificationRouter(userMgr *domain.UserManager, tg domain.TelegramSender
 		clock:          realClock{},
 		telegramReady:  make(chan struct{}),
 		lastUpdate:     make(map[updateKey]decimal.Decimal),
+		updateTimers:   make(map[string]*time.Timer),
+		updateJobs:     make(map[string]notificationJob),
 		invalidated:    make(map[string]struct{}),
+		signalCancel:   make(map[string]context.CancelFunc),
+		signalCtx:      make(map[string]context.Context),
 		reliableCtx:    reliableCtx,
 		reliableCancel: reliableCancel,
 	}
-	const workerCount = 4
 	nr.wg.Add(workerCount)
 	for i := 0; i < workerCount; i++ {
 		go nr.worker()
@@ -166,64 +180,84 @@ func (nr *NotificationRouter) enqueue(job notificationJob) bool {
 func (nr *NotificationRouter) sendJob(job notificationJob) {
 	isClose := strings.HasSuffix(job.key, ":close")
 	if job.signal != nil && !isClose {
-		nr.lifecycleMu.Lock()
-		_, invalid := nr.invalidated[job.signal.ID]
-		nr.lifecycleMu.Unlock()
-		if invalid {
+		ctx, valid := nr.signalDeliveryContext(job.signal.ID)
+		if !valid {
 			return
 		}
-	}
-	if job.revalidate && job.signal != nil {
-		nr.mu.RLock()
-		revalidator := nr.revalidator
-		nr.mu.RUnlock()
-		if revalidator != nil {
-			current, ok := revalidator(job.signal)
-			if !ok || current == nil {
-				return
-			}
+		if job.revalidate {
 			nr.mu.RLock()
-			now := nr.clock.Now()
-			config := nr.config
+			revalidator := nr.revalidator
 			nr.mu.RUnlock()
-			if config != nil && current.PeakSpread.LessThan(config.GetHardMinSpread()) {
+			if revalidator != nil {
+				current, ok := revalidator(job.signal)
+				if !ok || current == nil {
+					return
+				}
+				nr.mu.RLock()
+				now := nr.clock.Now()
+				config := nr.config
+				nr.mu.RUnlock()
+				if config != nil && current.PeakSpread.LessThan(config.GetHardMinSpread()) {
+					return
+				}
+				job.chatIDs = nr.currentEligibleChatIDs(current, job.chatIDs, now)
+				if len(job.chatIDs) == 0 {
+					return
+				}
+				job.text = renderSignalNotification(current, !isClose, strings.HasSuffix(job.key, ":update"))
+			}
+		}
+		for {
+			nr.mu.RLock()
+			tg := nr.telegram
+			closed := nr.closed
+			nr.mu.RUnlock()
+			if tg != nil {
+				// Do not hold lifecycle locks across network I/O. CLOSE cancels the
+				// per-signal context, which aborts reliable retries immediately.
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if reliable, ok := tg.(domain.ReliableTelegramSender); ok {
+					err := reliable.BroadcastReliable(ctx, job.text, job.chatIDs)
+					if err != nil && ctx.Err() == nil {
+						slog.Warn("reliable telegram delivery failed", "signal_id", job.signal.ID, "error", err)
+					}
+				} else {
+					tg.Broadcast(job.text, job.chatIDs)
+				}
 				return
 			}
-			job.chatIDs = nr.currentEligibleChatIDs(current, job.chatIDs, now)
-			if len(job.chatIDs) == 0 {
+			if closed {
 				return
 			}
-			job.text = renderSignalNotification(current, !isClose, strings.HasSuffix(job.key, ":update"))
+			select {
+			case <-nr.telegramReady:
+			case <-nr.stop:
+				return
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
+
 	for {
 		nr.mu.RLock()
 		tg := nr.telegram
 		closed := nr.closed
 		nr.mu.RUnlock()
 		if tg != nil {
-			// Serialize the final lifecycle check with CLOSE invalidation and the
-			// actual transport call. Thus a queued UPDATE can never be sent after
-			// Tracker has committed the signal to CLOSED.
-			nr.lifecycleMu.Lock()
-			if job.signal != nil && !isClose {
-				if _, invalid := nr.invalidated[job.signal.ID]; invalid {
-					nr.lifecycleMu.Unlock()
-					return
-				}
-			}
-			if reliable, ok := tg.(domain.ReliableTelegramSender); ok && job.signal != nil {
+			if reliable, ok := tg.(domain.ReliableTelegramSender); ok {
 				nr.mu.RLock()
-				reliableCtx := nr.reliableCtx
+				ctx := nr.reliableCtx
 				nr.mu.RUnlock()
-				err := reliable.BroadcastReliable(reliableCtx, job.text, job.chatIDs)
-				nr.lifecycleMu.Unlock()
-				if err != nil {
-					slog.Warn("reliable telegram delivery failed", "signal_id", job.signal.ID, "error", err)
+				if err := reliable.BroadcastReliable(ctx, job.text, job.chatIDs); err != nil {
+					slog.Warn("reliable telegram delivery failed", "error", err)
 				}
 			} else {
 				tg.Broadcast(job.text, job.chatIDs)
-				nr.lifecycleMu.Unlock()
 			}
 			return
 		}
@@ -236,6 +270,33 @@ func (nr *NotificationRouter) sendJob(job notificationJob) {
 			return
 		}
 	}
+}
+
+func (nr *NotificationRouter) signalDeliveryContext(signalID string) (context.Context, bool) {
+	if nr == nil {
+		return nil, false
+	}
+	if signalID == "" {
+		// Some unit/integration callers construct signals without a lifecycle ID.
+		// They still need normal notification delivery; per-signal cancellation is
+		// simply unavailable for such signals, so fall back to the router context.
+		nr.lifecycleMu.Lock()
+		ctx := nr.reliableCtx
+		nr.lifecycleMu.Unlock()
+		return ctx, ctx != nil
+	}
+	nr.lifecycleMu.Lock()
+	defer nr.lifecycleMu.Unlock()
+	if _, invalid := nr.invalidated[signalID]; invalid {
+		return nil, false
+	}
+	if ctx, ok := nr.signalCtx[signalID]; ok {
+		return ctx, true
+	}
+	ctx, cancel := context.WithCancel(nr.reliableCtx)
+	nr.signalCancel[signalID] = cancel
+	nr.signalCtx[signalID] = ctx
+	return ctx, true
 }
 
 func (nr *NotificationRouter) currentEligibleChatIDs(signal *domain.ArbitrageSignal, chatIDs []int64, now time.Time) []int64 {
@@ -359,6 +420,11 @@ func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOp
 	if isOpened {
 		jobKind = "open"
 	}
+	if isOpened {
+		if _, ok := nr.signalDeliveryContext(signal.ID); !ok {
+			return targets
+		}
+	}
 	nr.enqueue(notificationJob{key: signal.ID + ":" + jobKind, text: text, chatIDs: append([]int64(nil), targets...), signal: signal.Snapshot(), revalidate: isOpened})
 	return targets
 }
@@ -411,8 +477,52 @@ func (nr *NotificationRouter) ProcessSignalUpdate(signal *domain.ArbitrageSignal
 		return nil
 	}
 	text := fmt.Sprintf("📈 SIGNAL UPDATE\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), now.Format(time.RFC3339Nano))
-	nr.enqueue(notificationJob{key: signal.ID + ":update", text: text, chatIDs: append([]int64(nil), targets...), signal: signal.Snapshot(), revalidate: true})
+	nr.scheduleUpdate(notificationJob{key: signal.ID + ":update", text: text, chatIDs: append([]int64(nil), targets...), signal: signal.Snapshot(), revalidate: true})
 	return targets
+}
+
+func (nr *NotificationRouter) scheduleUpdate(job notificationJob) {
+	if nr == nil || job.signal == nil || job.key == "" || len(job.chatIDs) == 0 {
+		return
+	}
+	nr.updateMu.Lock()
+	// Coalesce bursts of threshold crossings. The latest snapshot and recipients
+	// win, while a single timer creates at most one UPDATE for the burst.
+	if existing, ok := nr.updateJobs[job.key]; ok {
+		job.chatIDs = mergeChatIDs(existing.chatIDs, job.chatIDs)
+	}
+	nr.updateJobs[job.key] = job
+	if timer := nr.updateTimers[job.key]; timer != nil {
+		timer.Reset(updateDebounce)
+		nr.updateMu.Unlock()
+		return
+	}
+	nr.updateTimers[job.key] = time.AfterFunc(updateDebounce, func() {
+		nr.updateMu.Lock()
+		latest, ok := nr.updateJobs[job.key]
+		delete(nr.updateJobs, job.key)
+		delete(nr.updateTimers, job.key)
+		nr.updateMu.Unlock()
+		if ok {
+			nr.enqueue(latest)
+		}
+	})
+	nr.updateMu.Unlock()
+}
+
+func mergeChatIDs(a, b []int64) []int64 {
+	seen := make(map[int64]struct{}, len(a)+len(b))
+	out := make([]int64, 0, len(a)+len(b))
+	for _, ids := range [][]int64{a, b} {
+		for _, id := range ids {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (nr *NotificationRouter) invalidateSignal(signalID string) {
@@ -421,7 +531,19 @@ func (nr *NotificationRouter) invalidateSignal(signalID string) {
 	}
 	nr.lifecycleMu.Lock()
 	nr.invalidated[signalID] = struct{}{}
+	if cancel := nr.signalCancel[signalID]; cancel != nil {
+		cancel()
+		delete(nr.signalCancel, signalID)
+		delete(nr.signalCtx, signalID)
+	}
 	nr.lifecycleMu.Unlock()
+	nr.updateMu.Lock()
+	if timer := nr.updateTimers[signalID+":update"]; timer != nil {
+		timer.Stop()
+		delete(nr.updateTimers, signalID+":update")
+	}
+	delete(nr.updateJobs, signalID+":update")
+	nr.updateMu.Unlock()
 }
 
 func (nr *NotificationRouter) dropPending(key string) {
@@ -443,6 +565,11 @@ func (nr *NotificationRouter) ClearSignalUpdates(signalID string) {
 			delete(nr.lastUpdate, key)
 		}
 	}
+	if timer := nr.updateTimers[signalID+":update"]; timer != nil {
+		timer.Stop()
+		delete(nr.updateTimers, signalID+":update")
+	}
+	delete(nr.updateJobs, signalID+":update")
 	nr.updateMu.Unlock()
 }
 
