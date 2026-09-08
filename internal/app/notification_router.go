@@ -3,6 +3,7 @@ package app
 import (
 	"crypto-screener/internal/domain"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -10,36 +11,61 @@ import (
 )
 
 type notificationJob struct {
-	text    string
-	chatIDs []int64
+	key        string
+	text       string
+	chatIDs    []int64
+	signal     *domain.ArbitrageSignal
+	revalidate bool
+}
+
+// updateState prevents duplicate UPDATEs when several peak observations cross
+// the same user threshold concurrently. It is intentionally in-memory: the
+// notification ledger is runtime state, not analytics data.
+type updateKey struct {
+	signalID string
+	chatID   int64
 }
 
 type NotificationRouter struct {
 	userMgr       *domain.UserManager
 	telegram      domain.TelegramSender
 	volume        *VolumeEngine
-	jobs          chan notificationJob
+	config        *domain.ScreenerConfig
+	wake          chan struct{}
+	pending       map[string]notificationJob
 	stop          chan struct{}
 	wg            sync.WaitGroup
 	mu            sync.RWMutex
 	closed        bool
 	clock         Clock
 	telegramReady chan struct{}
+	revalidator   func(*domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool)
+	updateMu      sync.Mutex
+	lastUpdate    map[updateKey]decimal.Decimal
 }
 
-func NewNotificationRouter(userMgr *domain.UserManager, tg domain.TelegramSender, volumes ...*VolumeEngine) *NotificationRouter {
+func NewNotificationRouter(userMgr *domain.UserManager, tg domain.TelegramSender, extras ...any) *NotificationRouter {
 	var v *VolumeEngine
-	if len(volumes) > 0 {
-		v = volumes[0]
+	var cfg *domain.ScreenerConfig
+	for _, extra := range extras {
+		switch x := extra.(type) {
+		case *VolumeEngine:
+			v = x
+		case *domain.ScreenerConfig:
+			cfg = x
+		}
 	}
 	nr := &NotificationRouter{
 		userMgr:       userMgr,
 		telegram:      tg,
 		volume:        v,
-		jobs:          make(chan notificationJob, 10000),
+		config:        cfg,
+		wake:          make(chan struct{}, 1),
+		pending:       make(map[string]notificationJob),
 		stop:          make(chan struct{}),
 		clock:         realClock{},
 		telegramReady: make(chan struct{}),
+		lastUpdate:    make(map[updateKey]decimal.Decimal),
 	}
 	const workerCount = 4
 	nr.wg.Add(workerCount)
@@ -72,32 +98,88 @@ func (nr *NotificationRouter) SetTelegramSender(tg domain.TelegramSender) {
 	nr.mu.Unlock()
 }
 
+func (nr *NotificationRouter) SetRevalidator(fn func(*domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool)) {
+	if nr == nil {
+		return
+	}
+	nr.mu.Lock()
+	nr.revalidator = fn
+	nr.mu.Unlock()
+}
+
 func (nr *NotificationRouter) worker() {
 	defer nr.wg.Done()
 	for {
 		select {
 		case <-nr.stop:
 			return
-		default:
-		}
-		select {
-		case job := <-nr.jobs:
-			nr.sendJob(job)
-		case <-nr.stop:
-			// Shutdown must be bounded. Jobs already accepted into the queue are
-			// transient notifications; persistence/lifecycle state is handled by
-			// the tracker separately. Do not spend an unbounded amount of time
-			// draining Telegram work during process termination. NOTE: when both
-			// a queued job and the closed stop-channel are ready, select picks
-			// randomly — a pending notification MAY be dropped at shutdown. This
-			// is an accepted trade-off; callers that must guarantee delivery wait
-			// for Broadcast completion before Close (see tests).
-			return
+		case <-nr.wake:
+			for {
+				job, ok := nr.takePending()
+				if !ok {
+					break
+				}
+				nr.sendJob(job)
+			}
 		}
 	}
 }
 
+func (nr *NotificationRouter) takePending() (notificationJob, bool) {
+	nr.mu.Lock()
+	defer nr.mu.Unlock()
+	for key, job := range nr.pending {
+		delete(nr.pending, key)
+		return job, true
+	}
+	return notificationJob{}, false
+}
+
+func (nr *NotificationRouter) enqueue(job notificationJob) bool {
+	if nr == nil || job.key == "" || len(job.chatIDs) == 0 {
+		return false
+	}
+	nr.mu.Lock()
+	if nr.closed {
+		nr.mu.Unlock()
+		return false
+	}
+	nr.pending[job.key] = job
+	nr.mu.Unlock()
+	select {
+	case nr.wake <- struct{}{}:
+	default:
+	}
+	return true
+}
+
 func (nr *NotificationRouter) sendJob(job notificationJob) {
+	if job.revalidate && job.signal != nil {
+		nr.mu.RLock()
+		revalidator := nr.revalidator
+		nr.mu.RUnlock()
+		if revalidator != nil {
+			current, ok := revalidator(job.signal)
+			if !ok || current == nil {
+				return
+			}
+			nr.mu.RLock()
+			now := nr.clock.Now()
+			config := nr.config
+			nr.mu.RUnlock()
+			if config != nil && current.PeakSpread.LessThan(config.GetHardMinSpread()) {
+				return
+			}
+			job.chatIDs = nr.currentEligibleChatIDs(current, job.chatIDs, now)
+			if len(job.chatIDs) == 0 {
+				return
+			}
+			// Revalidation is performed immediately before transport, so an OPEN or
+			// UPDATE generated during a Telegram outage is discarded if the exact
+			// route no longer passes the global hard floor or current user filters.
+			job.text = renderSignalNotification(current, !strings.HasSuffix(job.key, ":close"), strings.HasSuffix(job.key, ":update"))
+		}
+	}
 	for {
 		nr.mu.RLock()
 		tg := nr.telegram
@@ -110,14 +192,37 @@ func (nr *NotificationRouter) sendJob(job notificationJob) {
 		if closed {
 			return
 		}
-		// Keep accepted notifications until transport becomes available instead
-		// of coupling business target calculation to Telegram initialization.
 		select {
 		case <-nr.telegramReady:
 		case <-nr.stop:
 			return
 		}
 	}
+}
+
+func (nr *NotificationRouter) currentEligibleChatIDs(signal *domain.ArbitrageSignal, chatIDs []int64, now time.Time) []int64 {
+	if nr == nil || nr.userMgr == nil || signal == nil {
+		return nil
+	}
+	wanted := make(map[int64]struct{}, len(chatIDs))
+	for _, id := range chatIDs {
+		wanted[id] = struct{}{}
+	}
+	out := make([]int64, 0, len(chatIDs))
+	nr.userMgr.Range(func(u domain.User) bool {
+		if _, ok := wanted[u.ChatID]; !ok || signal.PeakSpread.LessThan(u.MinSpread) || !fundingAllowed(signal, u, now) {
+			return true
+		}
+		volume := signal.QuoteVolume
+		if u.Timeframe != domain.TF_24h && nr.volume != nil {
+			volume = nr.volume.GetRouteVolumeEstimate(signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.Symbol, u.Timeframe, signal.OpenedAt).Volume
+		}
+		if volume.GreaterThanOrEqual(u.MinVolume) {
+			out = append(out, u.ChatID)
+		}
+		return true
+	})
+	return out
 }
 
 func (nr *NotificationRouter) Close() {
@@ -156,6 +261,23 @@ func fundingAllowed(signal *domain.ArbitrageSignal, u domain.User, now time.Time
 	return next.Sub(now) >= time.Duration(u.MinFundingMinutes)*time.Minute
 }
 
+func renderSignalNotification(signal *domain.ArbitrageSignal, opened, update bool) string {
+	if signal == nil {
+		return ""
+	}
+	fundingText := "Funding: N/A"
+	if !signal.BuyNextFunding.IsZero() || !signal.SellNextFunding.IsZero() {
+		fundingText = fmt.Sprintf("Funding buy: %s (%s) | sell: %s (%s)", signal.BuyFundingRate.StringFixed(6), formatFundingTime(signal.BuyNextFunding), signal.SellFundingRate.StringFixed(6), formatFundingTime(signal.SellNextFunding))
+	}
+	if update {
+		return fmt.Sprintf("📈 SIGNAL UPDATE\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), signal.OpenedAt.Format(time.RFC3339Nano))
+	}
+	if opened {
+		return fmt.Sprintf("🚨 SIGNAL OPENED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nSpread (net): %s%%\n%s\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.InitialSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.OpenedAt.Format(time.RFC3339Nano))
+	}
+	return fmt.Sprintf("✅ SIGNAL CLOSED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nFinal (net): %s%%\n%s\nDuration: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), signal.FinalSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.Duration.Round(time.Millisecond))
+}
+
 func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOpened bool) []int64 {
 	if nr == nil || signal == nil || nr.userMgr == nil {
 		return nil
@@ -190,34 +312,88 @@ func (nr *NotificationRouter) ProcessSignal(signal *domain.ArbitrageSignal, isOp
 		return nil
 	}
 
-	fundingText := "Funding: N/A"
-	if !signal.BuyNextFunding.IsZero() || !signal.SellNextFunding.IsZero() {
-		fundingText = fmt.Sprintf("Funding buy: %s (%s) | sell: %s (%s)", signal.BuyFundingRate.StringFixed(6), formatFundingTime(signal.BuyNextFunding), signal.SellFundingRate.StringFixed(6), formatFundingTime(signal.SellNextFunding))
-	}
-	var text string
-	if isOpened {
-		text = fmt.Sprintf("🚨 SIGNAL OPENED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nSpread (net): %s%%\n%s\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.InitialSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.OpenedAt.Format(time.RFC3339Nano))
-	} else {
-		text = fmt.Sprintf("✅ SIGNAL CLOSED\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nFinal (net): %s%%\n%s\nDuration: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), signal.FinalSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), fundingText, signal.Duration.Round(time.Millisecond))
-	}
+	text := renderSignalNotification(signal, isOpened, false)
 
-	job := notificationJob{text: text, chatIDs: append([]int64(nil), targets...)}
+	jobKind := "close"
+	if isOpened {
+		jobKind = "open"
+	}
+	nr.enqueue(notificationJob{key: signal.ID + ":" + jobKind, text: text, chatIDs: append([]int64(nil), targets...), signal: signal.Snapshot(), revalidate: isOpened})
+	return targets
+}
+
+// ProcessSignalUpdate sends a per-user UPDATE only when the current peak crosses
+// that user's configured percentage-point step. A jump across multiple steps
+// produces one message containing the current peak, never a burst of catch-up
+// messages.
+func (nr *NotificationRouter) ProcessSignalUpdate(signal *domain.ArbitrageSignal) []int64 {
+	if nr == nil || signal == nil || nr.userMgr == nil || !signal.IsActive {
+		return nil
+	}
 	nr.mu.RLock()
-	closed = nr.closed
+	closed := nr.closed
+	now := nr.clock.Now()
 	nr.mu.RUnlock()
 	if closed {
 		return nil
 	}
-	// The queue is intentionally large and serviced by a worker pool so Telegram
-	// latency cannot serialize all notifications behind one slow chat. We still
-	// use a blocking send: an OPEN/CLOSE signal is business-critical and must not
-	// be silently discarded.
-	select {
-	case nr.jobs <- job:
-		return targets
-	case <-nr.stop:
+	var targets []int64
+	nr.userMgr.Range(func(u domain.User) bool {
+		if !u.UpdateStep.IsPositive() || signal.PeakSpread.LessThan(u.MinSpread) || !fundingAllowed(signal, u, now) {
+			return true
+		}
+		volume := signal.QuoteVolume
+		if u.Timeframe != domain.TF_24h && nr.volume != nil {
+			volume = nr.volume.GetRouteVolumeEstimate(signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.Symbol, u.Timeframe, signal.OpenedAt).Volume
+		}
+		if volume.LessThan(u.MinVolume) {
+			return true
+		}
+		steps := signal.PeakSpread.Sub(signal.InitialSpread).Div(u.UpdateStep).IntPart()
+		if steps < 1 {
+			return true
+		}
+		threshold := signal.InitialSpread.Add(u.UpdateStep.Mul(decimal.NewFromInt(steps)))
+		key := updateKey{signalID: signal.ID, chatID: u.ChatID}
+		nr.updateMu.Lock()
+		last := nr.lastUpdate[key]
+		if threshold.LessThanOrEqual(last) {
+			nr.updateMu.Unlock()
+			return true
+		}
+		nr.lastUpdate[key] = threshold
+		nr.updateMu.Unlock()
+		targets = append(targets, u.ChatID)
+		return true
+	})
+	if len(targets) == 0 {
 		return nil
 	}
+	text := fmt.Sprintf("📈 SIGNAL UPDATE\nSymbol: %s\nType: %s\nRoute: %s [%s] → %s [%s]\nPeak (net): %s%%\nTime: %s", signal.Symbol, signal.SpreadType, signal.BuyExchange, signal.BuyMarket, signal.SellExchange, signal.SellMarket, signal.PeakSpread.Mul(decimal.NewFromInt(100)).StringFixed(4), now.Format(time.RFC3339Nano))
+	nr.enqueue(notificationJob{key: signal.ID + ":update", text: text, chatIDs: append([]int64(nil), targets...), signal: signal.Snapshot(), revalidate: true})
+	return targets
+}
+
+func (nr *NotificationRouter) dropPending(key string) {
+	if nr == nil || key == "" {
+		return
+	}
+	nr.mu.Lock()
+	delete(nr.pending, key)
+	nr.mu.Unlock()
+}
+
+func (nr *NotificationRouter) ClearSignalUpdates(signalID string) {
+	if nr == nil || signalID == "" {
+		return
+	}
+	nr.updateMu.Lock()
+	for key := range nr.lastUpdate {
+		if key.signalID == signalID {
+			delete(nr.lastUpdate, key)
+		}
+	}
+	nr.updateMu.Unlock()
 }
 
 func formatFundingTime(t time.Time) string {

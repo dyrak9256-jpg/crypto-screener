@@ -39,7 +39,6 @@ type Bot struct {
 	commandWg  sync.WaitGroup
 	sendWg     sync.WaitGroup
 	closeOnce  sync.Once
-	sendMu     sync.RWMutex
 	closed     atomic.Bool
 	commands   chan commandRequest
 	sendStop   chan struct{}
@@ -64,12 +63,17 @@ func NewBot(id int64, token string, handler domain.CommandHandler) (*Bot, error)
 }
 func (b *Bot) commandWorker() {
 	defer b.commandWg.Done()
-	for req := range b.commands {
-		if b.cmdHandler == nil {
-			continue
+	for {
+		select {
+		case <-b.sendStop:
+			return
+		case req := <-b.commands:
+			if b.cmdHandler == nil {
+				continue
+			}
+			response := b.cmdHandler.HandleCommand(b.id, req.chatID, req.username, req.command, req.args)
+			b.SendPrivateMessage(req.chatID, response)
 		}
-		response := b.cmdHandler.HandleCommand(b.id, req.chatID, req.username, req.command, req.args)
-		b.SendPrivateMessage(req.chatID, response)
 	}
 }
 func (b *Bot) sendWorker() {
@@ -140,8 +144,6 @@ func telegramRetryAfter(err error) (time.Duration, bool) {
 func errorsAs(err error, target any) bool { return errors.As(err, target) }
 func (b *Bot) SendPrivateMessage(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
-	b.sendMu.RLock()
-	defer b.sendMu.RUnlock()
 	if b.closed.Load() {
 		return
 	}
@@ -152,49 +154,34 @@ func (b *Bot) SendPrivateMessage(chatID int64, text string) {
 		slog.Warn("telegram send queue full, message dropped", "bot_id", b.id, "chat_id", chatID)
 	}
 }
+
 func (b *Bot) Broadcast(text string, chatIDs []int64) {
 	for _, id := range chatIDs {
 		msg := tgbotapi.NewMessage(id, text)
-		b.sendMu.RLock()
 		if b.closed.Load() {
-			b.sendMu.RUnlock()
 			return
 		}
 		select {
 		case b.sendChan <- msg:
+		case <-b.sendStop:
+			return
 		default:
 			observability.TelegramDropped()
-			slog.Warn("telegram send queue full, broadcast dropped", "bot_id", b.id, "chat_id", id)
+			slog.Warn("telegram send queue full, broadcast message dropped", "bot_id", b.id, "chat_id", id)
 		}
-		b.sendMu.RUnlock()
 	}
 }
 
 func (b *Bot) Close() {
 	b.closeOnce.Do(func() {
-		if b.commands != nil {
-			close(b.commands)
-		}
-		b.commandWg.Wait()
-		b.sendMu.Lock()
+		// commands and sendChan are intentionally never closed. Producers may be
+		// unwinding concurrently; sendStop is the sole shutdown signal, which
+		// eliminates send-on-closed-channel races.
 		b.closed.Store(true)
 		if b.sendStop != nil {
 			close(b.sendStop)
 		}
-		if b.sendChan != nil {
-			// Drain pending messages so the closed channel reads as empty:
-			// after shutdown nobody consumes them anyway.
-		drain:
-			for {
-				select {
-				case <-b.sendChan:
-				default:
-					break drain
-				}
-			}
-			close(b.sendChan)
-		}
-		b.sendMu.Unlock()
+		b.commandWg.Wait()
 		b.sendWg.Wait()
 	})
 }
@@ -224,6 +211,8 @@ func (b *Bot) StartPolling(ctx context.Context) error {
 			}
 			req := commandRequest{chatID: update.Message.Chat.ID, username: username, command: update.Message.Command(), args: strings.Fields(update.Message.CommandArguments())}
 			select {
+			case <-b.sendStop:
+				return nil
 			case b.commands <- req:
 			case <-ctx.Done():
 				return nil

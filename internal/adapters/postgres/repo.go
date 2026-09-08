@@ -243,14 +243,15 @@ func (r *Repository) SaveUser(ctx context.Context, u *domain.User) error {
 		return fmt.Errorf("user is nil")
 	}
 	const query = `
-		INSERT INTO users (chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, bot_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		INSERT INTO users (chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, update_step, bot_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
 		ON CONFLICT (chat_id) DO UPDATE SET
 			username   = EXCLUDED.username,
 			min_spread = EXCLUDED.min_spread,
 			min_volume = EXCLUDED.min_volume,
 			timeframe  = EXCLUDED.timeframe,
 			min_funding_minutes = EXCLUDED.min_funding_minutes,
+			update_step = EXCLUDED.update_step,
 			bot_id     = EXCLUDED.bot_id`
 
 	_, err := r.pool.Exec(ctx, query,
@@ -260,6 +261,7 @@ func (r *Repository) SaveUser(ctx context.Context, u *domain.User) error {
 		u.MinVolume.String(),
 		string(u.Timeframe),
 		u.MinFundingMinutes,
+		u.UpdateStep.String(),
 		u.BotID,
 	)
 	if err != nil {
@@ -285,7 +287,7 @@ func (r *Repository) GetAllUsers(ctx context.Context) ([]*domain.User, error) {
 		return nil, fmt.Errorf("postgres repository is nil")
 	}
 	const query = `
-		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, bot_id
+		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, update_step, bot_id
 		FROM users`
 
 	rows, err := r.pool.Query(ctx, query)
@@ -319,7 +321,7 @@ func (r *Repository) GetUserByChatID(ctx context.Context, chatID int64) (*domain
 		return nil, fmt.Errorf("postgres repository is nil")
 	}
 	const query = `
-		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, bot_id
+		SELECT chat_id, username, min_spread, min_volume, timeframe, min_funding_minutes, update_step, bot_id
 		FROM users WHERE chat_id = $1`
 
 	rows, err := r.pool.Query(ctx, query, chatID)
@@ -344,7 +346,7 @@ func scanUser(rows interface {
 	Scan(dest ...any) error
 }) (*domain.User, error) {
 	u := &domain.User{}
-	var spreadStr, volStr string
+	var spreadStr, volStr, updateStepStr string
 
 	if err := rows.Scan(
 		&u.ChatID,
@@ -353,6 +355,7 @@ func scanUser(rows interface {
 		&volStr,
 		&u.Timeframe,
 		&u.MinFundingMinutes,
+		&updateStepStr,
 		&u.BotID,
 	); err != nil {
 		return nil, fmt.Errorf("scan user row: %w", err)

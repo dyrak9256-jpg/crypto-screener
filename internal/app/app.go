@@ -54,15 +54,15 @@ type Application struct {
 	router           *NotificationRouter
 	tickChan         chan domain.MarketTick
 	trackerChan      chan domain.SpreadEvent
-	dbChan           chan *domain.ArbitrageSignal
+	persistence      *SignalPersistenceBuffer
 	ctx              atomic.Pointer[context.Context]
 	started          atomic.Bool
 	accepting        atomic.Bool
 	telegram         atomic.Value // domain.TelegramSender (для алертов мониторинга)
-	commandMu        sync.Mutex
 	ingestionWg      sync.WaitGroup
 	trackerWg        sync.WaitGroup
 	persistWg        sync.WaitGroup
+	janitorWg        sync.WaitGroup
 	ingestionQueues  []chan domain.MarketTick
 	dispatchStop     chan struct{}
 	ingestionStop    chan struct{}
@@ -78,7 +78,7 @@ func NewApplication(cfg *domain.ScreenerConfig, repo domain.SignalRepository, us
 	// Lifecycle events are sparse compared with market ticks. Keep a generous
 	// bounded queue so a short database stall cannot propagate into market-data
 	// ingestion; the persistence worker retries each item independently.
-	dbChan := make(chan *domain.ArbitrageSignal, 100_000)
+	persistence := NewSignalPersistenceBuffer()
 	userMgr := domain.NewUserManager()
 	fundingCfg := DefaultFundingConfig()
 	fundingCfg.MinSpread = cfg.GetHardMinSpread()
@@ -88,10 +88,11 @@ func NewApplication(cfg *domain.ScreenerConfig, repo domain.SignalRepository, us
 	}
 	volume := NewVolumeEngine()
 	aggregator := NewShardedAggregator(trackerChan, fundingMgr, cfg, userMgr, volume)
-	router := NewNotificationRouter(userMgr, nil, volume)
-	tracker := NewTracker(cfg, dbChan, router)
+	router := NewNotificationRouter(userMgr, nil, volume, cfg)
+	router.SetRevalidator(aggregator.RevalidateSignal)
+	tracker := NewTracker(cfg, persistence, router)
 	connMgr := NewConnectorManager(tickChan, fundingMgr, volume)
-	a := &Application{connManager: connMgr, aggregator: aggregator, tracker: tracker, fundingMgr: fundingMgr, volume: volume, config: cfg, userMgr: userMgr, userRepo: userRepo, router: router, tickChan: tickChan, trackerChan: trackerChan, dbChan: dbChan}
+	a := &Application{connManager: connMgr, aggregator: aggregator, tracker: tracker, fundingMgr: fundingMgr, volume: volume, config: cfg, userMgr: userMgr, userRepo: userRepo, router: router, tickChan: tickChan, trackerChan: trackerChan, persistence: persistence}
 	if settingsRepo, ok := repo.(domain.SettingsRepository); ok {
 		a.settingsRepo = settingsRepo
 	}
@@ -219,6 +220,10 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 		var first error
 		cleanupOnce.Do(func() {
 			a.accepting.Store(false)
+			if a.aggregator != nil && a.aggregator.janitorStop != nil {
+				close(a.aggregator.janitorStop)
+				a.janitorWg.Wait()
+			}
 			if err := a.connManager.StopAll(); err != nil {
 				first = err
 			}
@@ -255,7 +260,10 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 				a.trackerWg.Wait()
 			}
 			if persistStarted {
-				close(a.dbChan)
+				a.persistence.Close()
+				if persistCancel != nil {
+					persistCancel()
+				}
 				done := make(chan struct{})
 				go func() { a.persistWg.Wait(); close(done) }()
 				select {
@@ -307,6 +315,9 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 			if u.MinFundingMinutes < 0 {
 				u.MinFundingMinutes = 0
 			}
+			if u.UpdateStep.IsNegative() {
+				u.UpdateStep = decimal.Zero
+			}
 			if _, ok := map[domain.Timeframe]bool{domain.TF_1m: true, domain.TF_5m: true, domain.TF_15m: true, domain.TF_30m: true, domain.TF_1h: true, domain.TF_4h: true, domain.TF_24h: true}[u.Timeframe]; !ok {
 				u.Timeframe = domain.TF_15m
 			}
@@ -325,7 +336,7 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 	persistCtx, persistCancel := context.WithCancel(context.Background())
 	defer persistCancel()
 	a.persistWg.Add(1)
-	go NewPersistenceWorker(a.dbChan, repo).Start(persistCtx, &a.persistWg)
+	go NewBufferedPersistenceWorker(a.persistence, repo).Start(persistCtx, &a.persistWg)
 	persistStarted = true
 	workers := runtime.NumCPU() * 2
 	if workers < 8 {
@@ -348,6 +359,7 @@ func (a *Application) Run(ctx context.Context, repo domain.SignalRepository) err
 	a.trackerWg.Add(1)
 	go a.trackerWorker()
 	trackerStarted = true
+	a.aggregator.StartJanitor(&a.janitorWg)
 	a.registerMetrics()
 	if factory != nil {
 		for _, name := range SupportedExchanges {
@@ -472,7 +484,7 @@ func (a *Application) persistSetting(key, value string) error {
 func (a *Application) registerMetrics() {
 	observability.WatchQueue("ticks", func() int { return len(a.tickChan) })
 	observability.WatchQueue("tracker_events", func() int { return len(a.trackerChan) })
-	observability.WatchQueue("db_signals", func() int { return len(a.dbChan) })
+	observability.WatchQueue("db_signals", func() int { return a.persistence.Len() })
 	observability.RegisterGaugeFunc("screener_active_signals", "Currently active arbitrage signals.", func() float64 {
 		return float64(a.tracker.ActiveCount())
 	})
@@ -549,8 +561,6 @@ func (a *Application) deleteUser(chatID int64) error {
 }
 
 func (a *Application) HandleCommand(botID, chatID int64, username, cmd string, args []string) string {
-	a.commandMu.Lock()
-	defer a.commandMu.Unlock()
 	if !a.accepting.Load() {
 		return "⚠️ Двигатель сейчас остановлен."
 	}
@@ -569,7 +579,7 @@ func (a *Application) HandleCommand(botID, chatID int64, username, cmd string, a
 		if exists {
 			return "✅ Вы уже подписаны! /help — список команд."
 		}
-		u := &domain.User{ChatID: chatID, Username: username, MinSpread: a.config.GetHardMinSpread(), MinVolume: decimal.Zero, Timeframe: domain.TF_15m, MinFundingMinutes: 30, BotID: botID}
+		u := &domain.User{ChatID: chatID, Username: username, MinSpread: a.config.GetHardMinSpread(), MinVolume: decimal.Zero, Timeframe: domain.TF_15m, MinFundingMinutes: 30, UpdateStep: decimal.Zero, BotID: botID}
 		if err := a.persistUser(u); err != nil {
 			return fmt.Sprintf("❌ Не удалось сохранить подписку: %v", err)
 		}
@@ -646,6 +656,24 @@ func (a *Application) HandleCommand(botID, chatID int64, username, cmd string, a
 		}
 		a.userMgr.SetUser(&u)
 		return fmt.Sprintf("✅ Минимальный объём: $%s", v.StringFixed(0))
+	case "setupdates":
+		if len(args) < 1 {
+			return "Usage: /setupdates <percentage_points> (0 = off, 0.3 = every +0.3 pp)"
+		}
+		v, err := decimal.NewFromString(args[0])
+		if err != nil || v.IsNegative() || v.GreaterThan(decimal.NewFromInt(100)) {
+			return "❌ Значение должно быть от 0 до 100 процентных пунктов."
+		}
+		u := *user
+		u.UpdateStep = v.Div(decimal.NewFromInt(100))
+		if err := a.persistUser(&u); err != nil {
+			return fmt.Sprintf("❌ Не удалось сохранить настройки: %v", err)
+		}
+		a.userMgr.SetUser(&u)
+		if u.UpdateStep.IsZero() {
+			return "✅ UPDATE-уведомления отключены."
+		}
+		return fmt.Sprintf("✅ UPDATE каждые +%s процентных пункта от OPEN.", v.StringFixed(4))
 	case "setfundingtime":
 		if len(args) < 1 {
 			return "Usage: /setfundingtime <minutes>"
@@ -743,7 +771,7 @@ func (a *Application) HandleCommand(botID, chatID int64, username, cmd string, a
 		}
 		return b.String()
 	case "help":
-		return "📋 *Доступные команды:*\n/start — Подписаться на сигналы\n/stop — Отписаться\n/setcross <%> — Мин. спред\n/setvol <USDT> — Мин. объём\n/settimeframe <tf> — Таймфрейм\n/setfundingtime <minutes> — Не присылать сигнал ближе к funding\n/signals — Активные и последние сигналы\n\n*Администраторам:*\n/sethardspread <%> — Глобальный минимум спреда\n/setfees — Комиссии бирж (учитываются в спреде)\n/addex /rmex — Подключение бирж на лету\n/stats — Статистика сигналов за 24 часа"
+		return "📋 *Доступные команды:*\n/start — Подписаться на сигналы\n/stop — Отписаться\n/setcross <%> — Мин. спред\n/setvol <USDT> — Мин. объём\n/settimeframe <tf> — Таймфрейм\n/setfundingtime <minutes> — Не присылать сигнал ближе к funding\n/setupdates <pp> — UPDATE при росте спреда на N процентных пунктов\n/signals — Активные и последние сигналы\n\n*Администраторам:*\n/sethardspread <%> — Глобальный минимум спреда\n/setfees — Комиссии бирж (учитываются в спреде)\n/addex /rmex — Подключение бирж на лету\n/stats — Статистика сигналов за 24 часа"
 	case "addex":
 		if len(args) < 1 {
 			return "Usage: /addex <exchange>"

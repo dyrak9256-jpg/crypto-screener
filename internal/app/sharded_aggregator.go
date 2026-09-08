@@ -48,6 +48,7 @@ type ShardedAggregator struct {
 	volume      *VolumeEngine
 	priceTTL    time.Duration
 	ticks       atomic.Uint64
+	janitorStop chan struct{}
 }
 
 func NewShardedAggregator(trackerChan chan<- domain.SpreadEvent, funding *FundingManager, cfg *domain.ScreenerConfig, extras ...any) *ShardedAggregator {
@@ -81,15 +82,7 @@ func shardFor(symbol string) int { return int(crc32.ChecksumIEEE([]byte(symbol))
 // Redundant quote updates are not persisted, which keeps DB traffic proportional to
 // actual arbitrage state changes rather than exchange ticker frequency.
 func (sa *ShardedAggregator) ProcessTick(tick domain.MarketTick) {
-	if sa.ticks.Add(1)%10000 == 0 {
-		if sa.funding != nil {
-			sa.funding.EvictStale()
-		}
-		if sa.volume != nil {
-			sa.volume.Janitor()
-		}
-		sa.Janitor()
-	}
+	sa.ticks.Add(1)
 	if !validTick(tick) {
 		return
 	}
@@ -445,6 +438,101 @@ func minDecimal(a, b decimal.Decimal) decimal.Decimal {
 	}
 	return b
 }
+
+// StartJanitor owns periodic cleanup independently of market tick flow. This
+// prevents stale state from surviving forever when all exchange feeds stop.
+func (sa *ShardedAggregator) StartJanitor(wg *sync.WaitGroup) {
+	if sa == nil || wg == nil {
+		return
+	}
+	if sa.janitorStop != nil {
+		return
+	}
+	sa.janitorStop = make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if sa.funding != nil {
+					sa.funding.EvictStale()
+				}
+				if sa.volume != nil {
+					sa.volume.Janitor()
+				}
+				sa.Janitor()
+			case <-sa.janitorStop:
+				return
+			}
+		}
+	}()
+}
+
+// RevalidateSignal recomputes only the exact buy/sell route from the latest
+// in-memory prices and funding state. It never scans the exchange universe.
+// This is used after Telegram outages so stale OPEN/UPDATE notifications are
+// discarded instead of being delivered from an old pre-rendered message.
+func (sa *ShardedAggregator) RevalidateSignal(signal *domain.ArbitrageSignal) (*domain.ArbitrageSignal, bool) {
+	if sa == nil || signal == nil {
+		return nil, false
+	}
+	now := time.Now()
+	shard := sa.shards[shardFor(signal.Symbol)]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	byExchange := shard.prices[normalizeSymbol(signal.Symbol)]
+	if byExchange == nil {
+		return nil, false
+	}
+	var ev domain.SpreadEvent
+	var ok bool
+	if signal.SpreadType == domain.CrossExchange && signal.BuyMarket == domain.MarketTypeFutures && signal.SellMarket == domain.MarketTypeFutures {
+		buy := byExchange[signal.BuyExchange][domain.MarketTypeFutures]
+		sell := byExchange[signal.SellExchange][domain.MarketTypeFutures]
+		if !fresh(buy, now, sa.priceTTL) || !fresh(sell, now, sa.priceTTL) || !buy.Ask.IsPositive() || !sell.Bid.IsPositive() {
+			return nil, false
+		}
+		spread := sell.Bid.Sub(buy.Ask).Div(buy.Ask).Sub(sa.config.FeeFor(signal.BuyExchange)).Sub(sa.config.FeeFor(signal.SellExchange))
+		if !spread.IsPositive() || sa.funding == nil {
+			return nil, false
+		}
+		fund := sa.funding.EvaluateFuturesPair(signal.BuyExchange, signal.Symbol, signal.SellExchange, signal.Symbol, spread, now)
+		if !fund.Profitable {
+			return nil, false
+		}
+		ev = domain.SpreadEvent{Symbol: signal.Symbol, SpreadType: signal.SpreadType, Spread: fund.NetSpread, BuyExchange: signal.BuyExchange, SellExchange: signal.SellExchange, BuyMarket: signal.BuyMarket, SellMarket: signal.SellMarket, BuyAsk: buy.Ask, SellBid: sell.Bid, QuoteVolume: minDecimal(buy.QuoteVolume24h, sell.QuoteVolume24h), BuyFundingRate: fund.BuyFundingRate, SellFundingRate: fund.SellFundingRate, BuyNextFunding: fund.BuyNextFundingTime, SellNextFunding: fund.SellNextFundingTime, Timestamp: now}
+		ok = true
+	} else if signal.SpreadType == domain.IntraExchange && signal.BuyMarket == domain.MarketTypeSpot && signal.SellMarket == domain.MarketTypeFutures && signal.BuyExchange == signal.SellExchange {
+		states := byExchange[signal.BuyExchange]
+		spot, fut := states[domain.MarketTypeSpot], states[domain.MarketTypeFutures]
+		if !fresh(spot, now, sa.priceTTL) || !fresh(fut, now, sa.priceTTL) || !fut.Bid.GreaterThan(spot.Ask) || sa.funding == nil {
+			return nil, false
+		}
+		spread := fut.Bid.Sub(spot.Ask).Div(spot.Ask).Sub(sa.config.FeeFor(signal.BuyExchange)).Sub(sa.config.FeeFor(signal.SellExchange))
+		if !spread.IsPositive() {
+			return nil, false
+		}
+		fund := sa.funding.EvaluateSpotFutures(signal.BuyExchange, signal.Symbol, spread, now)
+		if !fund.Profitable {
+			return nil, false
+		}
+		ev = domain.SpreadEvent{Symbol: signal.Symbol, SpreadType: signal.SpreadType, Spread: fund.NetSpread, BuyExchange: signal.BuyExchange, SellExchange: signal.SellExchange, BuyMarket: signal.BuyMarket, SellMarket: signal.SellMarket, BuyAsk: spot.Ask, SellBid: fut.Bid, QuoteVolume: minDecimal(spot.QuoteVolume24h, fut.QuoteVolume24h), BuyFundingRate: fund.BuyFundingRate, SellFundingRate: fund.SellFundingRate, BuyNextFunding: fund.BuyNextFundingTime, SellNextFunding: fund.SellNextFundingTime, Timestamp: now}
+		ok = true
+	}
+	if !ok {
+		return nil, false
+	}
+	copy := signal.Snapshot()
+	copy.PeakSpread = ev.Spread
+	copy.QuoteVolume = ev.QuoteVolume
+	copy.BuyFundingRate, copy.SellFundingRate = ev.BuyFundingRate, ev.SellFundingRate
+	copy.BuyNextFunding, copy.SellNextFunding = ev.BuyNextFunding, ev.SellNextFunding
+	return copy, true
+}
+
 func (sa *ShardedAggregator) Janitor() {
 	now := time.Now()
 	cut := now.Add(-sa.priceTTL * 12)

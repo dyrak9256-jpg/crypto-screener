@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS users (
     min_volume NUMERIC(30, 8) NOT NULL DEFAULT 0,
     timeframe VARCHAR(10) NOT NULL DEFAULT '15m',
     min_funding_minutes INTEGER NOT NULL DEFAULT 30,
+    update_step NUMERIC(20, 8) NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -38,6 +39,7 @@ CREATE INDEX IF NOT EXISTS idx_signals_active ON signals(is_active);
 
 -- Backward-compatible migration for databases created by older versions.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS min_funding_minutes INTEGER NOT NULL DEFAULT 30;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS update_step NUMERIC(20, 8) NOT NULL DEFAULT 0;
 
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS buy_exchange VARCHAR(50) NOT NULL DEFAULT '';
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS sell_exchange VARCHAR(50) NOT NULL DEFAULT '';

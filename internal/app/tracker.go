@@ -15,12 +15,40 @@ type Tracker struct {
 	mu            sync.Mutex
 	activeSignals map[string]*domain.ArbitrageSignal
 	config        *domain.ScreenerConfig
-	dbChan        chan<- *domain.ArbitrageSignal
+	persistence   persistenceSink
 	router        *NotificationRouter
 }
 
-func NewTracker(cfg *domain.ScreenerConfig, dbChan chan<- *domain.ArbitrageSignal, router *NotificationRouter) *Tracker {
-	return &Tracker{activeSignals: make(map[string]*domain.ArbitrageSignal), config: cfg, dbChan: dbChan, router: router}
+type persistenceSink interface {
+	Put(*domain.ArbitrageSignal) error
+}
+
+type channelPersistenceSink struct {
+	ch chan<- *domain.ArbitrageSignal
+}
+
+func (s channelPersistenceSink) Put(signal *domain.ArbitrageSignal) error {
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case s.ch <- signal:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("database queue remained full for 5s")
+	}
+}
+
+func NewTracker(cfg *domain.ScreenerConfig, dbSink any, router *NotificationRouter) *Tracker {
+	var sink persistenceSink
+	switch v := dbSink.(type) {
+	case persistenceSink:
+		sink = v
+	case chan<- *domain.ArbitrageSignal:
+		sink = channelPersistenceSink{ch: v}
+	case chan *domain.ArbitrageSignal:
+		sink = channelPersistenceSink{ch: v}
+	}
+	return &Tracker{activeSignals: make(map[string]*domain.ArbitrageSignal), config: cfg, persistence: sink, router: router}
 }
 
 // ActiveSnapshot возвращает копии активных сигналов (для /signals).
@@ -128,11 +156,8 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 		}
 	}
 
-	if persist != nil && t.dbChan != nil {
-		// Lifecycle/peak events are rare and must not be silently dropped. The
-		// bounded queue normally accepts immediately; a sustained DB outage is
-		// given a finite grace period so market-data workers are not blocked forever.
-		if err := t.enqueuePersistence(persist, 5*time.Second); err != nil {
+	if persist != nil && t.persistence != nil {
+		if err := t.persistence.Put(persist); err != nil {
 			observability.DBError()
 			slog.Error("tracker: persistence enqueue failed", "signal_id", persist.ID, "error", err)
 		}
@@ -153,24 +178,13 @@ func (t *Tracker) HandleEvent(event domain.SpreadEvent) {
 				t.mu.Unlock()
 			}
 		} else {
+			t.router.dropPending(notify.ID + ":update")
 			t.router.ProcessSignal(notify, false)
+			t.router.ClearSignalUpdates(notify.ID)
 		}
-	}
-}
-
-func (t *Tracker) enqueuePersistence(signal *domain.ArbitrageSignal, timeout time.Duration) error {
-	if signal == nil || t.dbChan == nil {
-		return nil
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case t.dbChan <- signal:
-		return nil
-	case <-timer.C:
-		return fmt.Errorf("database queue remained full for %s", timeout)
+	} else if t.router != nil && persist != nil && event.Lifecycle == domain.SignalUpdated {
+		// UPDATE notifications are a user policy layered on top of the canonical
+		// signal peak; they never create extra persistence rows.
+		t.router.ProcessSignalUpdate(persist)
 	}
 }
